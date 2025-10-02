@@ -10,7 +10,11 @@ from typing import Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from .browser_automation import AutomationResult, attempt_automated_pdf_download
+from .browser_automation import (
+    AutomationResult,
+    attempt_automated_pdf_download,
+    ensure_playwright_setup,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +72,18 @@ class FetcherApp:
             variable=self.automation_enabled,
         ).grid(column=0, row=2, columnspan=3, sticky="w", pady=(12, 0))
 
+        ttk.Button(
+            container,
+            text="Prepare automation dependencies",
+            command=self._setup_automation_dependencies,
+        ).grid(column=0, row=3, columnspan=3, sticky="w", pady=(12, 0))
+
         ttk.Button(container, text="Download bibliography", command=self.download_bibliography).grid(
-            column=0, row=3, columnspan=3, pady=(16, 0)
+            column=0, row=4, columnspan=3, pady=(16, 0)
         )
 
         ttk.Label(container, textvariable=self.status_var, foreground="#444444").grid(
-            column=0, row=4, columnspan=3, sticky="w", pady=(12, 0)
+            column=0, row=5, columnspan=3, sticky="w", pady=(12, 0)
         )
 
     # ------------------------------------------------------------------
@@ -147,6 +157,28 @@ class FetcherApp:
         chosen = filedialog.askdirectory(parent=self.root, initialdir=str(current), title="Select downloads folder")
         if chosen:
             self.download_dir_var.set(chosen)
+
+    def _setup_automation_dependencies(self) -> None:
+        """Install Playwright and the headless browser without leaving the app."""
+
+        report = ensure_playwright_setup()
+        for entry in report.logs:
+            logger.info("Automation setup: %s", entry)
+
+        if report.succeeded:
+            messagebox.showinfo(
+                "Automation ready",
+                "Playwright and the Chromium browser are installed for this interpreter.",
+            )
+            self.status_var.set("Automation dependencies prepared")
+        else:
+            error = report.error or "An unknown error prevented installation."
+            messagebox.showerror(
+                "Automation setup failed",
+                "Could not prepare the automation environment.\n\n"
+                f"Details:\n{error}\n\nSee the application logs for the full transcript.",
+            )
+            self.status_var.set("Automation setup encountered an error")
 
 
 __all__ = ["FetcherApp", "FetcherConfig"]

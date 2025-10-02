@@ -6,7 +6,11 @@ scriptable browser.
 ## How it works
 
 1. Launch the application and paste the article URL in the **Article URL** field.
-2. Pick a downloads folder, then decide how you want to grab the PDF:
+2. Click **Prepare automation dependencies** if you want the in-app helper to install
+   Playwright and the bundled Chromium browser into the interpreter that is currently
+   running the GUI (no external terminal required). The button is safe to press even
+   if everything is already installed—it simply verifies the setup.
+3. Pick a downloads folder, then decide how you want to grab the PDF:
    - Leave **Attempt automatic PDF download** unchecked to follow the existing flow.
      The app will open a file picker so you can select the PDF that you downloaded
      manually in your regular browser.
@@ -15,15 +19,22 @@ scriptable browser.
      authentication, and the helper will then try to click common “PDF” or
      “Download” buttons automatically. When a download succeeds the file is saved to
      the configured downloads folder and the manual picker is skipped.
-3. If automation cannot run (for example, Playwright is not installed) or fails to
-   find a PDF link, the application falls back to the manual dialog so you can select
-   the file yourself.
+4. If automation cannot run or fails to find a PDF link, the application falls back
+   to the manual dialog so you can select the file yourself.
 
 ## Installation
 
+You can install everything from inside the GUI by pressing
+**Prepare automation dependencies**. The helper runs `python -m pip install
+playwright` followed by `python -m playwright install chromium` using the exact
+interpreter that launched the app, so PyCharm virtual environments work without
+opening a shell.
+
+Prefer to manage dependencies manually? Run the same commands yourself:
+
 ```bash
-pip install playwright           # install the automation runtime
-playwright install chromium      # download the controllable Chromium browser
+python -m pip install playwright
+python -m playwright install chromium
 ```
 
 Tkinter ships with the CPython standard library on most platforms. If your Python

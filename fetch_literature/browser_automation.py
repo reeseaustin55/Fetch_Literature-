@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+import subprocess
+import sys
 from typing import List, Optional, Sequence
 
 DEFAULT_SELECTORS: tuple[str, ...] = (
@@ -29,6 +31,88 @@ class AutomationResult:
 
     def record(self, message: str) -> None:
         self.logs.append(message)
+
+
+@dataclass
+class SetupReport:
+    """Information about preparing the Playwright environment."""
+
+    succeeded: bool = False
+    error: Optional[str] = None
+    logs: List[str] = field(default_factory=list)
+
+    def record(self, message: str) -> None:
+        self.logs.append(message)
+
+
+_PLAYWRIGHT_READY = False
+_BROWSERS_READY: set[str] = set()
+
+
+def _run_subprocess(command: Sequence[str], report: SetupReport) -> bool:
+    """Execute *command* and capture stdout/stderr into ``report``."""
+
+    quoted = " ".join(command)
+    report.record(f"Executing: {quoted}")
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.stdout:
+        report.record(completed.stdout.strip())
+    if completed.stderr:
+        report.record(completed.stderr.strip())
+    if completed.returncode != 0:
+        report.error = (
+            report.error
+            or f"Command '{quoted}' exited with status {completed.returncode}."
+        )
+        return False
+    return True
+
+
+def _ensure_playwright_setup(browser: str, report: SetupReport, *, install_browser: bool) -> bool:
+    """Ensure Playwright and the requested browser runtime are available."""
+
+    global _PLAYWRIGHT_READY
+    if not _PLAYWRIGHT_READY:
+        try:
+            import importlib
+
+            importlib.import_module("playwright.async_api")
+            _PLAYWRIGHT_READY = True
+            report.record("Playwright already installed.")
+        except ImportError:
+            report.record("Playwright not found; attempting to install via pip.")
+            command = [sys.executable, "-m", "pip", "install", "playwright"]
+            if not _run_subprocess(command, report):
+                report.error = report.error or (
+                    "Failed to install Playwright automatically. "
+                    "Install it manually with 'pip install playwright'."
+                )
+                return False
+            try:
+                import importlib
+
+                importlib.import_module("playwright.async_api")
+                _PLAYWRIGHT_READY = True
+                report.record("Playwright installed successfully.")
+            except ImportError as exc:  # pragma: no cover - defensive guard
+                report.error = (
+                    "Playwright remains unavailable after installation attempt: "
+                    f"{exc}"
+                )
+                return False
+
+    if install_browser and browser not in _BROWSERS_READY:
+        report.record(f"Ensuring Playwright browser '{browser}' is installed.")
+        command = [sys.executable, "-m", "playwright", "install", browser]
+        if not _run_subprocess(command, report):
+            report.error = report.error or (
+                f"Failed to install the Playwright '{browser}' browser runtime."
+            )
+            return False
+        _BROWSERS_READY.add(browser)
+        report.record(f"Browser '{browser}' installation confirmed.")
+
+    return True
 
 
 async def _run_in_browser(
@@ -102,26 +186,24 @@ def attempt_automated_pdf_download(
     """Attempt to fetch a bibliography PDF using Playwright."""
 
     if not candidate_url:
-        return AutomationResult(attempted=False, error="No URL provided for automated download.")
-
-    try:
-        import importlib
-
-        importlib.import_module("playwright.async_api")
-    except ImportError:
         return AutomationResult(
-            attempted=False,
-            error=(
-                "Playwright is not installed. Install it with 'pip install playwright' "
-                "and run 'playwright install chromium' to set up the browser runtime."
-            ),
+            attempted=False, error="No URL provided for automated download."
         )
 
     download_path = Path(download_dir or Path.cwd() / "downloads")
     download_path.mkdir(parents=True, exist_ok=True)
 
     selectors_to_try = list(dict.fromkeys((selectors or []) + list(DEFAULT_SELECTORS)))
-    result = AutomationResult(attempted=True)
+    result = AutomationResult(attempted=False)
+
+    setup_report = SetupReport(succeeded=False)
+    if not _ensure_playwright_setup(browser, setup_report, install_browser=True):
+        result.error = setup_report.error
+        result.logs.extend(setup_report.logs)
+        return result
+
+    result.logs.extend(setup_report.logs)
+    result.attempted = True
 
     coroutine = _run_in_browser(
         candidate_url,
@@ -150,4 +232,18 @@ def attempt_automated_pdf_download(
     return result
 
 
-__all__ = ["AutomationResult", "attempt_automated_pdf_download"]
+def ensure_playwright_setup(browser: str = "chromium") -> SetupReport:
+    """Public helper to prepare the automation dependencies."""
+
+    report = SetupReport(succeeded=False)
+    if _ensure_playwright_setup(browser, report, install_browser=True):
+        report.succeeded = True
+    return report
+
+
+__all__ = [
+    "AutomationResult",
+    "SetupReport",
+    "attempt_automated_pdf_download",
+    "ensure_playwright_setup",
+]
