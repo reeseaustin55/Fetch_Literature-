@@ -188,4 +188,16 @@ class FetcherApp:
             self.status_var.set("Automation setup encountered an error")
 
 
-__all__ = ["FetcherApp", "FetcherConfig"]
+def main() -> None:
+    """Launch the Fetcher GUI."""
+
+    root = tk.Tk()
+    FetcherApp(root)
+    root.mainloop()
+
+
+__all__ = ["FetcherApp", "FetcherConfig", "main"]
+
+
+if __name__ == "__main__":  # pragma: no cover - GUI entry point
+    main()
