@@ -18,8 +18,9 @@ python fetch_pdfs.py
 
 When the window opens:
 
-1. Paste the bibliography into the large text box. Separate citations with an
-   empty line.
+1. Paste the bibliography into the large text box. Citations can be separated
+   by blank lines or standard numbering such as `(1)`, `[2]`, or `3.` at the
+   start of each entry.
 2. Click **Download PDFs**.
 3. Monitor progress in the log at the bottom of the window.
 

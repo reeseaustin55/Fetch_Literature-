@@ -66,20 +66,32 @@ def sanitize_filename(text: str, max_length: int = 80) -> str:
     return cleaned or "citation"
 
 
+ENTRY_START_PATTERN = re.compile(
+    r"^\s*(?:\(\d+\)|\[\d+\]|\d+[.)])\s*",
+    re.MULTILINE,
+)
+
+
 def read_bibliography_entries(text: str) -> Iterable[str]:
     """Split the bibliography text into individual entries."""
 
     entries: list[str] = []
     current: list[str] = []
 
-    for line in text.splitlines():
-        striped = line.strip()
-        if not striped:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+
+        if not line:
             if current:
                 entries.append(" ".join(current))
                 current = []
             continue
-        current.append(striped)
+
+        if current and ENTRY_START_PATTERN.match(line):
+            entries.append(" ".join(current))
+            current = []
+
+        current.append(line)
 
     if current:
         entries.append(" ".join(current))
