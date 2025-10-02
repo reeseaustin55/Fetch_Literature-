@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import threading
+import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Iterable, Optional
@@ -31,10 +34,11 @@ from urllib.parse import urljoin
 
 import requests
 import tkinter as tk
-from tkinter import messagebox, scrolledtext
+from tkinter import filedialog, messagebox, scrolledtext
 
 
 DOI_PATTERN = re.compile(r"10\.\d{4,9}/[^\s\"<>]+", re.IGNORECASE)
+URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 DEFAULT_OUTPUT_DIR_NAME = "FetchedBibliographyPDFs"
 
 
@@ -64,6 +68,16 @@ def sanitize_filename(text: str, max_length: int = 80) -> str:
     if len(cleaned) > max_length:
         cleaned = cleaned[:max_length].rstrip()
     return cleaned or "citation"
+
+
+def extract_urls(text: str) -> list[str]:
+    """Return HTTP(S) URLs embedded in *text*."""
+
+    urls = []
+    for match in URL_PATTERN.findall(text):
+        url = match.rstrip(".,);")
+        urls.append(url)
+    return urls
 
 
 ENTRY_START_PATTERN = re.compile(
@@ -264,6 +278,18 @@ def unpaywall_pdf_lookup(doi: str) -> Optional[str]:
     return None
 
 
+@dataclass
+class ManualDownloadRequest:
+    """Instruction sent from the worker thread to the UI for manual handling."""
+
+    index: int
+    total: int
+    citation: str
+    destination: Path
+    candidate_urls: list[str]
+    response_queue: Queue[bool]
+
+
 class FetcherApp:
     """Tkinter-based GUI for fetching PDFs from bibliography entries."""
 
@@ -285,7 +311,9 @@ class FetcherApp:
         self.log_area.pack(padx=10, pady=(5, 10), fill=tk.BOTH, expand=True)
 
         self.log_queue: Queue[str] = Queue()
+        self.manual_queue: Queue[ManualDownloadRequest] = Queue()
         self.root.after(100, self.process_log_queue)
+        self.root.after(150, self.process_manual_queue)
 
     def log(self, message: str) -> None:
         """Add a message to the log area in a thread-safe manner."""
@@ -351,6 +379,21 @@ class FetcherApp:
                 self.log(f"  ✓ Downloaded PDF from Crossref link")
                 continue
 
+            manual_urls: list[str] = []
+            if doi:
+                manual_urls.append(f"https://doi.org/{doi}")
+            if pdf_url:
+                manual_urls.append(pdf_url)
+            manual_urls.extend(url for url in extract_urls(citation) if url not in manual_urls)
+
+            if manual_urls:
+                self.log("  ⏳ Manual download required. Opening browser...")
+                if self.request_manual_download(index, len(entries), citation, destination, manual_urls):
+                    self.log("  ✓ Added manual download to folder")
+                    continue
+                else:
+                    self.log("  ⚠️ Manual download skipped or file not selected")
+
             self.log("  ✗ Failed to retrieve PDF. Check access manually.")
 
         self.log("Download attempt complete.")
@@ -358,6 +401,112 @@ class FetcherApp:
 
     def run(self) -> None:
         self.root.mainloop()
+
+    def request_manual_download(
+        self,
+        index: int,
+        total: int,
+        citation: str,
+        destination: Path,
+        candidate_urls: list[str],
+    ) -> bool:
+        response_queue: Queue[bool] = Queue(maxsize=1)
+        request = ManualDownloadRequest(
+            index=index,
+            total=total,
+            citation=citation,
+            destination=destination,
+            candidate_urls=candidate_urls,
+            response_queue=response_queue,
+        )
+        self.manual_queue.put(request)
+        try:
+            return response_queue.get()
+        except Exception:
+            return False
+
+    def process_manual_queue(self) -> None:
+        try:
+            request = self.manual_queue.get_nowait()
+        except Empty:
+            pass
+        else:
+            self.handle_manual_request(request)
+        finally:
+            self.root.after(150, self.process_manual_queue)
+
+    def handle_manual_request(self, request: ManualDownloadRequest) -> None:
+        if request.candidate_urls:
+            # Open the first URL automatically.
+            webbrowser.open_new_tab(request.candidate_urls[0])
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Manual PDF Download Required")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        message = (
+            "Automatic download failed. A browser tab has been opened so you can "
+            "retrieve the PDF manually. Once downloaded, use the button below to "
+            "select the file and it will be copied into the bibliography folder."
+        )
+
+        tk.Label(dialog, text=message, wraplength=500, justify=tk.LEFT).pack(padx=15, pady=(15, 10))
+
+        if len(request.candidate_urls) > 1:
+            tk.Label(dialog, text="Useful links:", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", padx=15)
+            for url in request.candidate_urls:
+                link = tk.Label(dialog, text=url, fg="blue", cursor="hand2", wraplength=500, justify=tk.LEFT)
+                link.pack(anchor="w", padx=25)
+                link.bind("<Button-1>", lambda _event, target=url: webbrowser.open_new_tab(target))
+
+        button_frame = tk.Frame(dialog)
+        button_frame.pack(fill=tk.X, padx=15, pady=(10, 15))
+
+        def finish(result: bool) -> None:
+            if not request.response_queue.full():
+                request.response_queue.put(result)
+            dialog.destroy()
+
+        def on_select_file() -> None:
+            file_path = filedialog.askopenfilename(
+                title="Select downloaded PDF",
+                filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            )
+            if not file_path:
+                return
+
+            selected = Path(file_path)
+            if not selected.exists():
+                messagebox.showerror("Fetch Literature PDFs", "The selected file does not exist.")
+                return
+
+            destination = request.destination
+            if selected.suffix and selected.suffix.lower() != destination.suffix.lower():
+                destination = destination.with_suffix(selected.suffix)
+
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(selected, destination)
+            except OSError as exc:
+                messagebox.showerror(
+                    "Fetch Literature PDFs",
+                    f"Unable to copy the selected file into the output folder:\n{exc}",
+                )
+                return
+
+            finish(True)
+
+        def on_skip() -> None:
+            finish(False)
+
+        select_button = tk.Button(button_frame, text="Select Downloaded PDF", command=on_select_file)
+        select_button.pack(side=tk.LEFT)
+
+        skip_button = tk.Button(button_frame, text="Skip", command=on_skip)
+        skip_button.pack(side=tk.RIGHT)
+
+        dialog.protocol("WM_DELETE_WINDOW", on_skip)
 
 
 def main() -> None:

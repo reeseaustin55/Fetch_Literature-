@@ -24,6 +24,13 @@ When the window opens:
 2. Click **Download PDFs**.
 3. Monitor progress in the log at the bottom of the window.
 
+If a PDF cannot be downloaded automatically the app opens your default
+browser to the best available landing page and shows a dialog. Download the
+PDF in the browser, then click **Select Downloaded PDF** in the dialog to point
+the tool at the file you just saved. The file will be copied into the
+`FetchedBibliographyPDFs` folder and the download process continues with the
+next citation.
+
 ## How it works
 
 For each citation the script tries the following approaches:
@@ -46,6 +53,7 @@ that polite contact information is included in Crossref and Unpaywall requests:
 export CROSSREF_CONTACT_EMAIL="you@example.edu"
 ```
 
-> **Note:** Some publishers require authentication via your institution. If a
-> PDF cannot be retrieved automatically you may need to download it manually.
+> **Note:** Some publishers require authentication via your institution. When
+> that happens, use the manual dialog to fetch and place the PDF into the output
+> folder without interrupting the rest of the queue.
 
