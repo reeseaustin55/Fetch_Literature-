@@ -27,8 +27,9 @@ pip install -r requirements.txt
    terminal by using standard input.
 2. Run the script:
 
-   - If you simply execute `python fetch_pdfs.py` in a terminal, the GUI opens
-     automatically (as long as Tkinter is available) so you can paste the
+   - If you execute `python fetch_pdfs.py` without additional arguments and
+     there is no data coming from standard input, the script opens the GUI
+     automatically (provided Tkinter is available) so you can paste the
      bibliography and monitor download status messages.
    - To stay in the terminal, provide a file path or pipe the bibliography via
      standard input:
@@ -47,8 +48,8 @@ END
 ```
 
 ### Graphical interface
-Launch the GUI manually when desired (for example, on systems where standard
-input is being redirected):
+Launch the GUI manually when desired (for example, if your environment does not
+allow the script to auto-detect whether standard input has data):
 
 ```bash
 python fetch_pdfs.py --gui

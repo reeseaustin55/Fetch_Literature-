@@ -6,9 +6,11 @@ available PDF.  It saves the PDFs to the given directory.
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import queue
 import re
+import stat
 import sys
 import threading
 import time
@@ -81,6 +83,53 @@ def read_bibliography_text(path: Optional[str]) -> str:
     if path:
         return pathlib.Path(path).read_text(encoding="utf-8")
     return sys.stdin.read()
+
+
+def stdin_has_data() -> bool:
+    """Return True if data is waiting on stdin (e.g., piped input)."""
+
+    stdin = sys.stdin
+    if stdin is None:
+        return False
+
+    try:
+        if stdin.isatty():
+            return False
+    except Exception:
+        # If isatty() is unavailable or fails, assume no data to avoid blocking.
+        return False
+
+    # Try cheap stat-based detection (works for pipes and redirected files).
+    try:
+        mode = os.fstat(stdin.fileno()).st_mode
+    except (AttributeError, OSError):
+        mode = None
+
+    if mode is not None:
+        if stat.S_ISFIFO(mode) or stat.S_ISREG(mode):
+            return True
+        if stat.S_ISCHR(mode):
+            return False
+
+    # Buffered readers (e.g., TextIOWrapper) sometimes expose peek().
+    buffered = getattr(stdin, "buffer", stdin)
+    peek = getattr(buffered, "peek", None)
+    if callable(peek):
+        try:
+            return bool(peek(1))
+        except Exception:
+            pass
+
+    if os.name == "posix":
+        import select  # Imported lazily to avoid Windows select limitations.
+
+        try:
+            readable, _, _ = select.select([stdin], [], [], 0)
+        except (OSError, ValueError):
+            readable = []
+        return bool(readable)
+
+    return False
 
 
 def split_entries(text: str) -> List[str]:
@@ -345,7 +394,7 @@ def run_gui(args: argparse.Namespace) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
-    if args.gui or (args.bibliography is None and sys.stdin.isatty()):
+    if args.gui or (args.bibliography is None and not stdin_has_data()):
         run_gui(args)
         return 0
 
