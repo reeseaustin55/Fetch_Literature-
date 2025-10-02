@@ -28,13 +28,18 @@ When the window opens:
 For each citation the script tries the following approaches:
 
 1. **Direct DOI resolution** – If a DOI is present, the script attempts to
-   resolve it via `https://doi.org/` and download the resulting PDF.
-2. **Crossref lookup** – If no DOI is detected or the direct download fails,
-   the script queries the Crossref `query.bibliographic` endpoint and uses any
+   resolve it via `https://doi.org/`. If a landing page is returned instead of a
+   PDF, the HTML is scanned for common PDF link hints (e.g.,
+   `citation_pdf_url` meta tags and direct `.pdf` anchors).
+2. **Unpaywall open access lookup** – When direct resolution fails, the script
+   queries the Unpaywall API for an open-access PDF link associated with the
+   DOI.
+3. **Crossref lookup** – If no DOI is detected or prior attempts fail, the
+   script queries the Crossref `query.bibliographic` endpoint and uses any
    advertised PDF links.
 
 Set the `CROSSREF_CONTACT_EMAIL` environment variable to your email address so
-that polite contact information is included in Crossref requests:
+that polite contact information is included in Crossref and Unpaywall requests:
 
 ```bash
 export CROSSREF_CONTACT_EMAIL="you@example.edu"

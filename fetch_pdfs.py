@@ -27,6 +27,7 @@ import threading
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Iterable, Optional
+from urllib.parse import urljoin
 
 import requests
 import tkinter as tk
@@ -86,11 +87,15 @@ def read_bibliography_entries(text: str) -> Iterable[str]:
     return entries
 
 
-def request_headers() -> dict[str, str]:
-    contact = os.environ.get("CROSSREF_CONTACT_EMAIL", "email@example.com")
+def contact_email() -> str:
+    return os.environ.get("CROSSREF_CONTACT_EMAIL", "email@example.com")
+
+
+def request_headers(accept: str = "application/pdf, application/json;q=0.9, */*;q=0.8") -> dict[str, str]:
+    contact = contact_email()
     return {
-        "User-Agent": f"FetchLiterature/1.0 (mailto:{contact})",
-        "Accept": "application/pdf, application/json;q=0.9, */*;q=0.8",
+        "User-Agent": f"FetchLiterature/1.1 (mailto:{contact})",
+        "Accept": accept,
     }
 
 
@@ -115,6 +120,44 @@ def download_pdf_from_url(url: str, destination: Path) -> bool:
     return True
 
 
+def extract_pdf_url_from_html(html: str, base_url: str) -> Optional[str]:
+    """Attempt to locate a PDF URL within HTML content."""
+
+    meta_match = re.search(
+        r"<meta[^>]+name=[\"']citation_pdf_url[\"'][^>]+content=[\"']([^\"']+)",
+        html,
+        re.IGNORECASE,
+    )
+    if meta_match:
+        return urljoin(base_url, meta_match.group(1))
+
+    meta_generic = re.search(
+        r"<meta[^>]+content=[\"']([^\"']+\.pdf)[\"'][^>]*>",
+        html,
+        re.IGNORECASE,
+    )
+    if meta_generic:
+        return urljoin(base_url, meta_generic.group(1))
+
+    anchor_match = re.search(
+        r"<a[^>]+href=[\"']([^\"']+\.pdf(?:\?[^\"']*)?)[\"'][^>]*>",
+        html,
+        re.IGNORECASE,
+    )
+    if anchor_match:
+        return urljoin(base_url, anchor_match.group(1))
+
+    script_match = re.search(
+        r"\"pdfUrl\"\s*:\s*\"([^\"']+\.pdf)\"",
+        html,
+        re.IGNORECASE,
+    )
+    if script_match:
+        return urljoin(base_url, script_match.group(1))
+
+    return None
+
+
 def resolve_doi_to_pdf(doi: str, destination: Path) -> bool:
     """Attempt to resolve a DOI and download the PDF."""
 
@@ -136,7 +179,10 @@ def resolve_doi_to_pdf(doi: str, destination: Path) -> bool:
 
     # If the DOI resolved to a landing page, attempt to follow any direct PDF link.
     if "text/html" in content_type.lower():
-        pdf_url = response.headers.get("Location")
+        html = response.content.decode(errors="replace")
+        pdf_url = extract_pdf_url_from_html(html, response.url)
+        if not pdf_url:
+            pdf_url = response.headers.get("Location")
         if pdf_url:
             return download_pdf_from_url(pdf_url, destination)
 
@@ -150,7 +196,7 @@ def crossref_pdf_lookup(citation: str) -> Optional[str]:
         response = requests.get(
             "https://api.crossref.org/works",
             params={"query.bibliographic": citation, "rows": 1},
-            headers=request_headers(),
+            headers=request_headers("application/json, */*;q=0.8"),
             timeout=30,
         )
         response.raise_for_status()
@@ -169,6 +215,39 @@ def crossref_pdf_lookup(citation: str) -> Optional[str]:
     for link in links:
         if link.get("content-type", "").lower() == "application/pdf" and link.get("URL"):
             return link["URL"]
+
+    return None
+
+
+def unpaywall_pdf_lookup(doi: str) -> Optional[str]:
+    """Query the Unpaywall API for an open-access PDF URL."""
+
+    email = contact_email()
+    try:
+        response = requests.get(
+            f"https://api.unpaywall.org/v2/{doi}",
+            params={"email": email},
+            headers=request_headers("application/json, */*;q=0.8"),
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+
+    locations = []
+    if data.get("best_oa_location"):
+        locations.append(data["best_oa_location"])
+    locations.extend(data.get("oa_locations", []) or [])
+
+    for location in locations:
+        pdf_url = location.get("url_for_pdf") or location.get("url")
+        if pdf_url:
+            return pdf_url
 
     return None
 
@@ -247,6 +326,13 @@ class FetcherApp:
                     continue
                 else:
                     self.log(f"  ⚠️ Unable to download PDF directly from DOI {doi}")
+
+                unpaywall_url = unpaywall_pdf_lookup(doi)
+                if unpaywall_url and download_pdf_from_url(unpaywall_url, destination):
+                    self.log("  ✓ Downloaded via Unpaywall open access link")
+                    continue
+                elif unpaywall_url:
+                    self.log("  ⚠️ Unpaywall provided a link but download failed")
 
             pdf_url = crossref_pdf_lookup(citation)
             if pdf_url and download_pdf_from_url(pdf_url, destination):
