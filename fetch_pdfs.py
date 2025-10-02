@@ -160,35 +160,48 @@ class App(tk.Tk):
         super().__init__()
         self.title("Fetch Bibliography PDFs")
         self.geometry("700x500")
+        self.minsize(500, 400)
         self.resizable(True, True)
         self.download_thread: Optional[threading.Thread] = None
         self.downloader: Optional[PDFDownloader] = None
         self._build_ui()
 
     def _build_ui(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
         instruction = tk.Label(
             self, text="Paste your bibliography entries below (one per line):"
         )
-        instruction.pack(anchor="w", padx=10, pady=(10, 0))
+        instruction.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 0))
 
         self.text_box = scrolledtext.ScrolledText(self, wrap=tk.WORD)
-        self.text_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.text_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
 
         path_frame = tk.Frame(self)
-        path_frame.pack(fill=tk.X, padx=10)
+        path_frame.grid(row=2, column=0, sticky="ew", padx=10)
+        path_frame.columnconfigure(1, weight=1)
 
-        tk.Label(path_frame, text="Destination folder:").pack(side=tk.LEFT)
+        tk.Label(path_frame, text="Destination folder:").grid(row=0, column=0, sticky="w")
         self.path_var = tk.StringVar(value=str(Path.home() / "Desktop" / "Bibliography_PDFs"))
         self.path_entry = tk.Entry(path_frame, textvariable=self.path_var)
-        self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        tk.Button(path_frame, text="Browse", command=self._choose_folder).pack(side=tk.LEFT)
+        self.path_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        tk.Button(path_frame, text="Browse", command=self._choose_folder).grid(
+            row=0, column=2, padx=(0, 5)
+        )
+
+        controls_frame = tk.Frame(self)
+        controls_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(5, 10))
+        controls_frame.columnconfigure(0, weight=1)
 
         self.status_var = tk.StringVar(value="Idle")
-        status_label = tk.Label(self, textvariable=self.status_var, anchor="w")
-        status_label.pack(fill=tk.X, padx=10, pady=5)
+        status_label = tk.Label(controls_frame, textvariable=self.status_var, anchor="w")
+        status_label.grid(row=0, column=0, sticky="w")
 
-        self.download_button = tk.Button(self, text="Download PDFs", command=self._start_download)
-        self.download_button.pack(pady=10)
+        self.download_button = tk.Button(
+            controls_frame, text="Download PDFs", command=self._start_download
+        )
+        self.download_button.grid(row=0, column=1, padx=(10, 0))
 
     def _choose_folder(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.path_var.get())
