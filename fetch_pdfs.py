@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+import re
+import unicodedata
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 
@@ -34,8 +37,18 @@ else:  # pragma: no cover - executed only when selenium is unavailable
     TimeoutException = WebDriverException = Exception  # type: ignore
 
 
+REFERENCE_LEAD_PATTERN = re.compile(r"^\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*")
+
+
 def extract_references(text: str) -> List[str]:
-    """Combine non-empty lines into bibliography entries."""
+    """Split raw bibliography text into distinct references.
+
+    The parser groups contiguous non-empty lines, but also treats new numbering tokens
+    (e.g. "[12]", "(3)", or "4.") as the start of a fresh reference even when
+    references are provided without blank lines between them. Leading numbering
+    markers are stripped from the resulting reference text to improve search
+    results.
+    """
 
     references: List[str] = []
     current: List[str] = []
@@ -47,12 +60,76 @@ def extract_references(text: str) -> List[str]:
                 references.append(" ".join(current))
                 current = []
             continue
+
+        if REFERENCE_LEAD_PATTERN.match(stripped):
+            if current:
+                references.append(" ".join(current))
+                current = []
+            stripped = REFERENCE_LEAD_PATTERN.sub("", stripped, count=1).strip()
+
         current.append(stripped)
 
     if current:
         references.append(" ".join(current))
 
     return references
+
+
+INVALID_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_filename(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", name)
+    without_marks = "".join(
+        ch for ch in normalized if not unicodedata.combining(ch)
+    ).strip()
+    sanitized = INVALID_FILENAME_CHARS.sub("_", without_marks)
+    sanitized = re.sub(r"_+", "_", sanitized).strip("._")
+    return sanitized
+
+
+YEAR_PATTERN = re.compile(r"\b(19|20)\d{2}\b")
+TITLE_PATTERN = re.compile(r"\.\s+([A-Z][^.]+?)\.\s+[A-Z]")
+
+
+def derive_title(reference: str) -> str:
+    """Attempt to extract the study title from a reference string."""
+
+    cleaned = REFERENCE_LEAD_PATTERN.sub("", reference).strip()
+    if not cleaned:
+        return ""
+
+    pre_url = cleaned.split("http", 1)[0].strip()
+    search_scope = pre_url
+
+    match = TITLE_PATTERN.search(pre_url)
+    if match:
+        candidate = match.group(1).strip()
+    else:
+        year_match = YEAR_PATTERN.search(pre_url)
+        if year_match:
+            search_scope = pre_url[: year_match.start()].rstrip("., ;")
+        else:
+            search_scope = pre_url
+
+        segments = [
+            segment.strip() for segment in search_scope.split(". ") if segment.strip()
+        ]
+
+        candidate = ""
+        for segment in segments:
+            if segment.count(";") >= 1 and segment.count(" ") <= 3:
+                continue
+            if len(segment.split()) >= 3:
+                candidate = segment
+                break
+
+        if not candidate:
+            candidate = segments[0] if segments else pre_url
+
+        candidate = candidate.strip(" .;:,-")
+
+    return candidate
 
 
 @dataclass
@@ -348,7 +425,11 @@ class App(tk.Tk):
         try:
             self.downloader = PDFDownloader(temp_dir)
             for index, reference in enumerate(references, start=1):
-                output_name = f"reference_{index:03d}"
+                title = derive_title(reference)
+                sanitized_title = _sanitize_filename(title)[:150] if title else ""
+                output_name = (
+                    sanitized_title if sanitized_title else f"reference_{index:03d}"
+                )
                 preview = reference if len(reference) <= 80 else reference[:77] + "..."
                 self._update_status(f"Processing {index}/{len(references)}: {preview}")
                 result = self.downloader.download(reference, output_name, destination)
