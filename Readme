@@ -1,1 +1,45 @@
-temp
+# Bibliography PDF Downloader
+
+This project provides a Tkinter desktop application that accepts bibliography
+entries, extracts DOI/URL links, and uses Selenium to download the
+corresponding PDF files. Microsoft Edge (Chromium) is used by default, with an
+option to switch to Google Chrome if desired.
+
+## Features
+
+- Paste bibliography text into a convenient GUI window.
+- Choose the destination folder for downloaded PDFs (defaults to a
+  `Bibliography_PDFs` folder on the desktop).
+- Select between Edge and Chrome browsers.
+- Automated Selenium workflow that opens each DOI/URL, locates PDF download
+  buttons, and saves the files to the chosen folder.
+- Activity log embedded in the UI for easy progress tracking.
+
+## Running the Application
+
+1. Ensure Python 3.9+ is installed along with the required dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. Launch the application:
+
+   ```bash
+   python bibliography_downloader.py
+   ```
+
+3. Paste your bibliography, adjust settings as needed, and click **Download
+   PDFs**.
+
+## Requirements
+
+The application relies on the following packages:
+
+- `selenium`
+- `webdriver-manager`
+- `requests`
+- `tkinter` (included with standard Python installations on most platforms)
+
+Ensure that Microsoft Edge or Google Chrome is installed locally for the
+respective Selenium driver to control.
