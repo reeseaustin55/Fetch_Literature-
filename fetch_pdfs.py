@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,156 @@ def ensure_output_directory(base_dir: Path) -> Path:
     output_dir = base_dir / DEFAULT_OUTPUT_DIR_NAME
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def _windows_download_directory() -> Optional[Path]:
+    """Try to locate the Downloads folder on Windows systems."""
+
+    if os.name != "nt":
+        return None
+
+    # Newer Windows versions expose the GUID key; older ones have "Downloads".
+    candidates = (
+        "{374DE290-123F-4565-9164-39C4925E467B}",
+        "Downloads",
+    )
+
+    try:
+        import winreg  # type: ignore
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            for name in candidates:
+                try:
+                    value, _ = winreg.QueryValueEx(key, name)
+                except FileNotFoundError:
+                    continue
+                expanded = os.path.expandvars(value)
+                path = Path(expanded)
+                if path.exists():
+                    return path
+    except Exception:
+        # Fall back to environment heuristics if registry lookup fails.
+        pass
+
+    profile = os.environ.get("USERPROFILE")
+    if profile:
+        candidate = Path(profile) / "Downloads"
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def _xdg_download_directory() -> Optional[Path]:
+    """Locate the XDG-compliant download directory on POSIX systems."""
+
+    if os.name == "nt":
+        return None
+
+    config_file = Path.home() / ".config" / "user-dirs.dirs"
+    if not config_file.exists():
+        return None
+
+    try:
+        content = config_file.read_text(encoding="utf8")
+    except OSError:
+        return None
+
+    match = re.search(r"XDG_DOWNLOAD_DIR\s*=\s*\"([^\"]+)\"", content)
+    if not match:
+        return None
+
+    raw_path = match.group(1)
+    # Replace environment variables like $HOME.
+    expanded = os.path.expandvars(raw_path)
+    expanded = expanded.replace("$HOME", str(Path.home()))
+    path = Path(expanded).expanduser()
+    if path.exists():
+        return path
+
+    return None
+
+
+def get_download_directory() -> Optional[Path]:
+    """Best effort attempt to find the user's default downloads folder."""
+
+    path = _windows_download_directory()
+    if path:
+        return path
+
+    path = _xdg_download_directory()
+    if path:
+        return path
+
+    fallback = Path.home() / "Downloads"
+    if fallback.exists():
+        return fallback
+
+    return None
+
+
+def snapshot_pdf_files(directory: Path) -> dict[Path, tuple[float, int]]:
+    """Return a mapping of PDF paths to their (mtime, size) snapshot."""
+
+    snapshot: dict[Path, tuple[float, int]] = {}
+    try:
+        files = list(directory.glob("*.pdf"))
+    except OSError:
+        return snapshot
+
+    for path in files:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        snapshot[path.resolve()] = (stat.st_mtime, stat.st_size)
+    return snapshot
+
+
+def detect_new_pdf(
+    directory: Path,
+    snapshot: dict[Path, tuple[float, int]],
+    start_time: float,
+) -> Optional[Path]:
+    """Return a newly downloaded PDF that appeared after *start_time*."""
+
+    try:
+        candidates = sorted(
+            directory.glob("*.pdf"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+
+    for path in candidates:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+
+        if stat.st_mtime < start_time:
+            continue
+
+        resolved = path.resolve()
+        previous = snapshot.get(resolved)
+        if previous and stat.st_mtime <= previous[0] and stat.st_size == previous[1]:
+            continue
+
+        # Ensure the file is ready by trying to open it briefly.
+        try:
+            with path.open("rb") as handle:
+                handle.read(1)
+        except OSError:
+            continue
+
+        snapshot[resolved] = (stat.st_mtime, stat.st_size)
+        return path
+
+    return None
 
 
 def find_doi(text: str) -> Optional[str]:
@@ -447,8 +598,9 @@ class FetcherApp:
 
         message = (
             "Automatic download failed. A browser tab has been opened so you can "
-            "retrieve the PDF manually. Once downloaded, use the button below to "
-            "select the file and it will be copied into the bibliography folder."
+            "retrieve the PDF manually. Once the PDF finishes downloading, it will "
+            "be captured automatically and copied into the bibliography folder. "
+            "If automatic capture fails you can still browse for the file manually."
         )
 
         tk.Label(dialog, text=message, wraplength=500, justify=tk.LEFT).pack(padx=15, pady=(15, 10))
@@ -460,13 +612,60 @@ class FetcherApp:
                 link.pack(anchor="w", padx=25)
                 link.bind("<Button-1>", lambda _event, target=url: webbrowser.open_new_tab(target))
 
+        downloads_dir = get_download_directory()
+        status_var = tk.StringVar()
+        snapshot: dict[Path, tuple[float, int]] = {}
+        start_time = time.time()
+        poll_state = {"active": True, "notified": False}
+
+        def copy_to_destination(source: Path) -> bool:
+            destination = request.destination
+            if source.suffix and source.suffix.lower() != destination.suffix.lower():
+                destination = destination.with_suffix(source.suffix)
+
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            except OSError as exc:
+                messagebox.showerror(
+                    "Fetch Literature PDFs",
+                    f"Unable to copy the downloaded file into the output folder:\n{exc}",
+                )
+                return False
+
+            return True
+
+        if downloads_dir and downloads_dir.exists():
+            snapshot = snapshot_pdf_files(downloads_dir)
+            downloads_display = str(downloads_dir)
+            status_var.set(
+                f"Waiting for a PDF saved to {downloads_display}. Keep this dialog open until it is captured."
+            )
+        else:
+            status_var.set(
+                "Downloads folder could not be located automatically. Use the Browse button below when ready."
+            )
+
+        status_label = tk.Label(dialog, textvariable=status_var, wraplength=500, justify=tk.LEFT)
+        status_label.pack(padx=15, pady=(0, 10), anchor="w")
+
         button_frame = tk.Frame(dialog)
         button_frame.pack(fill=tk.X, padx=15, pady=(10, 15))
 
         def finish(result: bool) -> None:
             if not request.response_queue.full():
                 request.response_queue.put(result)
+            poll_state["active"] = False
             dialog.destroy()
+
+        def complete_with_file(file_path: Path) -> None:
+            if not copy_to_destination(file_path):
+                return
+
+            if status_var.get():
+                status_var.set(f"Captured {file_path.name} and copied it into the output folder.")
+
+            finish(True)
 
         def on_select_file() -> None:
             file_path = filedialog.askopenfilename(
@@ -481,32 +680,41 @@ class FetcherApp:
                 messagebox.showerror("Fetch Literature PDFs", "The selected file does not exist.")
                 return
 
-            destination = request.destination
-            if selected.suffix and selected.suffix.lower() != destination.suffix.lower():
-                destination = destination.with_suffix(selected.suffix)
-
-            try:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(selected, destination)
-            except OSError as exc:
-                messagebox.showerror(
-                    "Fetch Literature PDFs",
-                    f"Unable to copy the selected file into the output folder:\n{exc}",
-                )
-                return
-
-            finish(True)
+            complete_with_file(selected)
 
         def on_skip() -> None:
             finish(False)
 
-        select_button = tk.Button(button_frame, text="Select Downloaded PDF", command=on_select_file)
+        select_button = tk.Button(button_frame, text="Browse for PDF...", command=on_select_file)
         select_button.pack(side=tk.LEFT)
 
         skip_button = tk.Button(button_frame, text="Skip", command=on_skip)
         skip_button.pack(side=tk.RIGHT)
 
         dialog.protocol("WM_DELETE_WINDOW", on_skip)
+
+        if downloads_dir and downloads_dir.exists():
+            timeout_seconds = 300
+
+            def poll_for_download() -> None:
+                if not poll_state["active"]:
+                    return
+
+                new_file = detect_new_pdf(downloads_dir, snapshot, start_time)
+                if new_file:
+                    complete_with_file(new_file)
+                    return
+
+                elapsed = time.time() - start_time
+                if elapsed > timeout_seconds and not poll_state["notified"]:
+                    status_var.set(
+                        "No new PDF detected yet. Keep the dialog open, or use the Browse button to select the file manually."
+                    )
+                    poll_state["notified"] = True
+
+                dialog.after(1000, poll_for_download)
+
+            dialog.after(1500, poll_for_download)
 
 
 def main() -> None:

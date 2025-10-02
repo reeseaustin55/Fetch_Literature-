@@ -26,10 +26,11 @@ When the window opens:
 
 If a PDF cannot be downloaded automatically the app opens your default
 browser to the best available landing page and shows a dialog. Download the
-PDF in the browser, then click **Select Downloaded PDF** in the dialog to point
-the tool at the file you just saved. The file will be copied into the
-`FetchedBibliographyPDFs` folder and the download process continues with the
-next citation.
+PDF in the browser and leave the dialog open—the app watches your system
+Downloads folder and, as soon as a new PDF appears, it is copied into the
+`FetchedBibliographyPDFs` folder so the queue can continue. If the automatic
+capture misses a file, click **Browse for PDF...** in the dialog and point the
+tool at the correct download manually.
 
 ## How it works
 
@@ -54,6 +55,7 @@ export CROSSREF_CONTACT_EMAIL="you@example.edu"
 ```
 
 > **Note:** Some publishers require authentication via your institution. When
-> that happens, use the manual dialog to fetch and place the PDF into the output
-> folder without interrupting the rest of the queue.
+> that happens, sign in within the opened browser tab. The app will notice the
+> completed download in your Downloads folder and move it into the output
+> directory automatically, keeping the rest of the queue moving.
 
