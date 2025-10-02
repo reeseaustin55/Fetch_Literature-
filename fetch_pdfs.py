@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import re
 import shutil
 import tempfile
 import threading
@@ -21,7 +20,11 @@ import importlib.util
 selenium_spec = importlib.util.find_spec("selenium")
 if selenium_spec is not None:
     from selenium import webdriver
-    from selenium.common.exceptions import TimeoutException, WebDriverException
+    from selenium.common.exceptions import (
+        NoSuchElementException,
+        TimeoutException,
+        WebDriverException,
+    )
     from selenium.webdriver.common.by import By
     from selenium.webdriver.firefox.options import Options as FirefoxOptions
     from selenium.webdriver.support import expected_conditions as EC
@@ -31,25 +34,25 @@ else:  # pragma: no cover - executed only when selenium is unavailable
     TimeoutException = WebDriverException = Exception  # type: ignore
 
 
-DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
-URL_PATTERN = re.compile(r"https?://[^\s)]+", re.IGNORECASE)
+def extract_references(text: str) -> List[str]:
+    """Combine non-empty lines into bibliography entries."""
 
+    references: List[str] = []
+    current: List[str] = []
 
-def extract_targets(text: str) -> List[str]:
-    """Extract DOIs or URLs from the provided text."""
-    targets: List[str] = []
     for line in text.splitlines():
-        match = DOI_PATTERN.search(line)
-        if match:
-            doi = match.group(0)
-            if not doi.lower().startswith("http"):
-                doi = f"https://doi.org/{doi}"
-            targets.append(doi)
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                references.append(" ".join(current))
+                current = []
             continue
-        url_match = URL_PATTERN.search(line)
-        if url_match:
-            targets.append(url_match.group(0).rstrip(".))"))
-    return targets
+        current.append(stripped)
+
+    if current:
+        references.append(" ".join(current))
+
+    return references
 
 
 @dataclass
@@ -61,7 +64,9 @@ class DownloadResult:
 
 
 class PDFDownloader:
-    """Handles Selenium browser automation to download PDF files."""
+    """Handles Selenium browser automation to download PDF files via Google Scholar."""
+
+    SCHOLAR_URL = "https://scholar.google.com/"
 
     def __init__(self, download_dir: Path) -> None:
         if webdriver is None:
@@ -71,6 +76,7 @@ class PDFDownloader:
             )
         self.download_dir = download_dir
         self.driver = self._create_driver(download_dir)
+        self.base_handle = self.driver.current_window_handle
 
     @staticmethod
     def _create_driver(download_dir: Path) -> "webdriver.Firefox":
@@ -92,36 +98,110 @@ class PDFDownloader:
         except Exception:
             pass
 
-    def download(self, target_url: str, output_name: str, final_dir: Path) -> DownloadResult:
+    def download(self, reference: str, output_name: str, final_dir: Path) -> DownloadResult:
         existing_files = {p for p in self.download_dir.iterdir() if p.is_file()}
         try:
-            self.driver.get(target_url)
+            self._search_reference(reference)
         except WebDriverException as exc:  # pragma: no cover - runtime protection
-            return DownloadResult(target_url, False, f"Failed to open page: {exc}")
+            return DownloadResult(reference, False, f"Failed to open Google Scholar: {exc}")
 
         try:
-            link = self._wait_for_pdf_link()
+            result_block = self._get_first_result()
         except TimeoutException:
-            return DownloadResult(target_url, False, "Could not locate a PDF link on the page")
+            return DownloadResult(reference, False, "No Google Scholar results were found")
 
         try:
-            pdf_href = link.get_attribute("href") or ""
-            if pdf_href.lower().endswith(".pdf"):
-                # If direct PDF link, fetch using Selenium to keep authentication context
-                self.driver.execute_script("arguments[0].click();", link)
-            else:
-                link.click()
+            pdf_link = self._extract_pdf_link(result_block)
         except WebDriverException as exc:
-            return DownloadResult(target_url, False, f"Failed to trigger download: {exc}")
+            return DownloadResult(reference, False, f"Unable to inspect the first result: {exc}")
+
+        article_handle: Optional[str] = None
+        article_opened_in_new_tab = False
+
+        if pdf_link is None:
+            try:
+                article_link = result_block.find_element(By.CSS_SELECTOR, "h3 a")
+            except NoSuchElementException:
+                return DownloadResult(
+                    reference, False, "First result is missing an article link to follow"
+                )
+
+            article_handle, article_opened_in_new_tab = self._open_article_link(article_link)
+
+            try:
+                pdf_link = self._wait_for_pdf_link()
+            except TimeoutException:
+                return DownloadResult(
+                    reference,
+                    False,
+                    "Could not locate a PDF link on the article page",
+                )
+
+        if pdf_link is None:
+            return DownloadResult(
+                reference,
+                False,
+                "First result did not provide a downloadable PDF",
+            )
+
+        try:
+            self.driver.execute_script("arguments[0].click();", pdf_link)
+        except WebDriverException as exc:
+            return DownloadResult(reference, False, f"Failed to trigger PDF download: {exc}")
 
         downloaded = self._wait_for_new_file(existing_files)
         if downloaded is None:
-            return DownloadResult(target_url, False, "Download did not complete in time")
+            return DownloadResult(reference, False, "Download did not complete in time")
+
+        if article_opened_in_new_tab and article_handle:
+            self._close_tab(article_handle)
+
+        self._close_extra_tabs()
 
         destination = final_dir / f"{output_name}.pdf"
         destination = self._dedupe_destination(destination)
         shutil.move(str(downloaded), destination)
-        return DownloadResult(target_url, True, "Downloaded", destination)
+        return DownloadResult(reference, True, "Downloaded", destination)
+
+    def _search_reference(self, reference: str) -> None:
+        try:
+            self.driver.switch_to.window(self.base_handle)
+        except WebDriverException:
+            pass
+        self.driver.get(self.SCHOLAR_URL)
+        wait = WebDriverWait(self.driver, 20)
+        search_box = wait.until(EC.presence_of_element_located((By.NAME, "q")))
+        search_box.clear()
+        search_box.send_keys(reference)
+        search_box.submit()
+
+    def _get_first_result(self):
+        wait = WebDriverWait(self.driver, 20)
+        return wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "div.gs_r.gs_or.gs_scl")
+            )
+        )
+
+    @staticmethod
+    def _extract_pdf_link(result_block):
+        try:
+            return result_block.find_element(By.CSS_SELECTOR, "div.gs_or_ggsm a")
+        except NoSuchElementException:
+            return None
+
+    def _open_article_link(self, link):
+        existing_handles = set(self.driver.window_handles)
+        try:
+            self.driver.execute_script("arguments[0].click();", link)
+        except WebDriverException:
+            link.click()
+
+        new_handle = self._wait_for_new_window(existing_handles)
+        if new_handle:
+            self.driver.switch_to.window(new_handle)
+            return new_handle, True
+        return self.driver.current_window_handle, False
 
     def _wait_for_pdf_link(self):
         wait = WebDriverWait(self.driver, 20)
@@ -144,6 +224,38 @@ class PDFDownloader:
                     return candidate
             time.sleep(1)
         return None
+
+    def _wait_for_new_window(self, existing_handles: set[str]) -> Optional[str]:
+        end = time.time() + 10
+        while time.time() < end:
+            handles = set(self.driver.window_handles)
+            new_handles = handles - existing_handles
+            if new_handles:
+                return new_handles.pop()
+            time.sleep(0.5)
+        return None
+
+    def _close_tab(self, handle: str) -> None:
+        try:
+            self.driver.switch_to.window(handle)
+            self.driver.close()
+        except WebDriverException:
+            pass
+        finally:
+            try:
+                self.driver.switch_to.window(self.base_handle)
+            except WebDriverException:
+                pass
+
+    def _close_extra_tabs(self) -> None:
+        for handle in list(self.driver.window_handles):
+            if handle == self.base_handle:
+                continue
+            self._close_tab(handle)
+        try:
+            self.driver.switch_to.window(self.base_handle)
+        except WebDriverException:
+            pass
 
     @staticmethod
     def _dedupe_destination(path: Path) -> Path:
@@ -213,9 +325,11 @@ class App(tk.Tk):
             messagebox.showinfo("Download in progress", "Please wait for current download to finish.")
             return
 
-        targets = extract_targets(self.text_box.get("1.0", tk.END))
-        if not targets:
-            messagebox.showwarning("No targets", "No DOIs or URLs were found in the provided text.")
+        references = extract_references(self.text_box.get("1.0", tk.END))
+        if not references:
+            messagebox.showwarning(
+                "No references", "No bibliography entries were detected in the provided text."
+            )
             return
 
         destination = Path(self.path_var.get()).expanduser()
@@ -224,19 +338,20 @@ class App(tk.Tk):
         self.status_var.set("Starting downloads...")
         self.download_button.config(state=tk.DISABLED)
         self.download_thread = threading.Thread(
-            target=self._run_downloads, args=(targets, destination), daemon=True
+            target=self._run_downloads, args=(references, destination), daemon=True
         )
         self.download_thread.start()
 
-    def _run_downloads(self, targets: List[str], destination: Path) -> None:
+    def _run_downloads(self, references: List[str], destination: Path) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="fetch_pdfs_"))
         results: List[DownloadResult] = []
         try:
             self.downloader = PDFDownloader(temp_dir)
-            for index, target in enumerate(targets, start=1):
+            for index, reference in enumerate(references, start=1):
                 output_name = f"reference_{index:03d}"
-                self._update_status(f"Downloading {index}/{len(targets)}: {target}")
-                result = self.downloader.download(target, output_name, destination)
+                preview = reference if len(reference) <= 80 else reference[:77] + "..."
+                self._update_status(f"Processing {index}/{len(references)}: {preview}")
+                result = self.downloader.download(reference, output_name, destination)
                 results.append(result)
         except Exception as exc:  # pragma: no cover - GUI feedback only
             results.append(DownloadResult("Initialization", False, str(exc)))
@@ -248,7 +363,7 @@ class App(tk.Tk):
         success = sum(1 for r in results if r.success)
         failures = [r for r in results if not r.success]
 
-        summary_lines = [f"Downloaded {success} of {len(targets)} references."]
+        summary_lines = [f"Downloaded {success} of {len(references)} references."]
         for fail in failures:
             summary_lines.append(f"- {fail.target}: {fail.message}")
 
