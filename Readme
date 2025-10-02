@@ -1,1 +1,31 @@
-temp
+# Fetch Literature PDFs
+
+This repository provides a small Tkinter + Selenium utility that can automate downloading PDFs referenced in a bibliography.
+
+## Requirements
+
+- Python 3.9+
+- Firefox browser (since Chrome is not available)
+- `geckodriver` available on your system `PATH`
+- Python dependencies: `selenium`
+
+Install dependencies with:
+
+```bash
+pip install selenium
+```
+
+## Usage
+
+1. Run the script (for example from PyCharm):
+
+   ```bash
+   python fetch_pdfs.py
+   ```
+
+2. Paste bibliography entries into the text box. The script will automatically detect DOIs or direct URLs.
+3. Choose the destination folder for the downloaded PDFs (defaults to a folder on your Desktop).
+4. Click **Download PDFs**. The application will launch Firefox, navigate to each DOI/URL, click the first PDF link it finds, and save the file into the chosen folder.
+5. When finished, a summary dialog displays the results.
+
+Downloads occur through Firefox so they retain any session-based access you have in your browser profile.
