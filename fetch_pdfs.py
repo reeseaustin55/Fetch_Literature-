@@ -13,12 +13,14 @@ through their browser session.  Browser drivers are managed automatically via
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import List, Optional, Sequence
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -32,6 +34,8 @@ from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.edge.service import Service as EdgeService
 from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.microsoft import EdgeChromiumDriverManager
+
+import requests
 
 
 DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
@@ -85,6 +89,30 @@ def parse_bibliography(text: str) -> List[ReferenceLink]:
     return unique_links
 
 
+def _resolve_manual_driver(browser: str, errors: List[str]) -> Optional[Path]:
+    """Return a manually supplied driver path via env vars or PATH."""
+
+    env_map = {
+        "chrome": "CHROME_DRIVER_PATH",
+        "edge": "EDGE_DRIVER_PATH",
+    }
+    env_var = env_map.get(browser)
+    if env_var:
+        configured = os.environ.get(env_var)
+        if configured:
+            candidate = Path(configured).expanduser()
+            if candidate.exists():
+                return candidate
+            errors.append(f"{env_var} is set but {candidate} does not exist.")
+
+    command_names = ["chromedriver"] if browser == "chrome" else ["msedgedriver", "msedgedriver.exe"]
+    for name in command_names:
+        resolved = shutil.which(name)
+        if resolved:
+            return Path(resolved)
+    return None
+
+
 def build_driver(browser: str, download_dir: Path) -> webdriver.Remote:
     """Create a Selenium WebDriver instance for the chosen browser."""
 
@@ -100,14 +128,62 @@ def build_driver(browser: str, download_dir: Path) -> webdriver.Remote:
         options = ChromeOptions()
         options.add_experimental_option("prefs", prefs)
         options.add_argument("--start-maximized")
-        service = ChromeService(ChromeDriverManager().install())
+
+        errors: List[str] = []
+
+        manual_driver = _resolve_manual_driver("chrome", errors)
+        service: Optional[ChromeService]
+        if manual_driver:
+            service = ChromeService(executable_path=str(manual_driver))
+        else:
+            try:
+                service = ChromeService(ChromeDriverManager().install())
+            except (requests.exceptions.RequestException, ValueError) as exc:
+                errors.append(
+                    "Automatic Chrome driver download failed. "
+                    "Set CHROME_DRIVER_PATH to an existing driver executable or add it to PATH."
+                )
+                errors.append(str(exc))
+                service = None
+
+        if not service:
+            if not errors:
+                errors.append(
+                    "Chrome driver executable not found. Set CHROME_DRIVER_PATH or place chromedriver on PATH."
+                )
+            raise WebDriverException("\n".join(errors))
+
         driver = webdriver.Chrome(service=service, options=options)
     else:
         options = EdgeOptions()
         options.use_chromium = True
         options.add_experimental_option("prefs", prefs)
         options.add_argument("--start-maximized")
-        service = EdgeService(EdgeChromiumDriverManager().install())
+
+        errors: List[str] = []
+
+        manual_driver = _resolve_manual_driver("edge", errors)
+        service: Optional[EdgeService]
+        if manual_driver:
+            service = EdgeService(executable_path=str(manual_driver))
+        else:
+            try:
+                service = EdgeService(EdgeChromiumDriverManager().install())
+            except (requests.exceptions.RequestException, ValueError) as exc:
+                errors.append(
+                    "Automatic Edge driver download failed. "
+                    "Set EDGE_DRIVER_PATH to an existing driver executable or add it to PATH."
+                )
+                errors.append(str(exc))
+                service = None
+
+        if not service:
+            if not errors:
+                errors.append(
+                    "Edge driver executable not found. Set EDGE_DRIVER_PATH or place msedgedriver on PATH."
+                )
+            raise WebDriverException("\n".join(errors))
+
         driver = webdriver.Edge(service=service, options=options)
 
     driver.set_page_load_timeout(120)
@@ -236,7 +312,13 @@ class DownloadApp:
         browser_frame = ttk.Frame(main_frame)
         browser_frame.pack(fill=tk.X, pady=5)
         ttk.Label(browser_frame, text="Browser:").pack(side=tk.LEFT)
-        browser_menu = ttk.OptionMenu(browser_frame, self.browser_var, "Edge", "edge", "chrome")
+        browser_menu = ttk.OptionMenu(
+            browser_frame,
+            self.browser_var,
+            self.browser_var.get(),
+            "edge",
+            "chrome",
+        )
         browser_menu.pack(side=tk.LEFT, padx=5)
 
         button_frame = ttk.Frame(main_frame)

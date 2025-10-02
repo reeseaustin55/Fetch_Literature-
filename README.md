@@ -41,7 +41,10 @@ download folder or browser if necessary, and click **Download PDFs**.
 
 - The script relies on `webdriver-manager` to automatically download the
   appropriate Edge or Chrome driver.  Ensure that the chosen browser is
-  installed on your system.
+  installed on your system.  If automatic driver retrieval fails (for
+  example, while offline), download the driver manually and either place it on
+  your `PATH` or set the `EDGE_DRIVER_PATH` / `CHROME_DRIVER_PATH`
+  environment variables before launching the app.
 - Access to full PDFs still depends on your institutional or personal
   subscription rights.  The script simply automates the same browser workflow
   you would otherwise perform manually.
