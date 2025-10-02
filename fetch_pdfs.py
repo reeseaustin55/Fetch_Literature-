@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import queue
 import re
 import sys
+import threading
 import time
 from typing import List, Optional
 
@@ -66,6 +68,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of Crossref matches to inspect for each citation (default: 1).",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Launch a simple GUI for pasting bibliography text and downloading PDFs.",
     )
     return parser.parse_args(argv)
 
@@ -205,8 +212,142 @@ def download_for_entry(
     return last_error or "Unable to retrieve PDF."
 
 
+def run_gui(args: argparse.Namespace) -> None:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+        from tkinter.scrolledtext import ScrolledText
+    except ImportError as exc:
+        print("Tkinter is required for the GUI but is not available:", exc)
+        return
+
+    output_dir_var = tk.StringVar(value=str(args.output_dir.expanduser().resolve()))
+    user_agent_var = tk.StringVar(value=args.user_agent)
+
+    root = tk.Tk()
+    root.title("Fetch Literature PDFs")
+
+    status_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+
+    def choose_directory() -> None:
+        directory = filedialog.askdirectory(initialdir=output_dir_var.get() or None)
+        if directory:
+            output_dir_var.set(directory)
+
+    def append_status(message: str) -> None:
+        results_text.configure(state="normal")
+        results_text.insert("end", message + "\n")
+        results_text.see("end")
+        results_text.configure(state="disabled")
+
+    def worker(entries: List[str], total: int, output_dir: pathlib.Path, user_agent: str) -> None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": user_agent})
+
+        for index, entry in enumerate(entries, start=1):
+            prefix = f"[{index}/{total}]"
+            status_queue.put(f"{prefix} {entry}")
+            try:
+                result = download_for_entry(
+                    entry,
+                    session=session,
+                    output_dir=output_dir,
+                    user_agent=user_agent,
+                    max_results=args.max_results,
+                )
+                status_queue.put(f"    -> {result}")
+            except requests.HTTPError as exc:
+                status_queue.put(f"    -> HTTP error: {exc}")
+            except requests.RequestException as exc:
+                status_queue.put(f"    -> Request failed: {exc}")
+            time.sleep(max(0.0, args.sleep))
+
+        status_queue.put(None)
+
+    def start_download() -> None:
+        bibliography_text = bibliography_text_widget.get("1.0", "end").strip()
+        if not bibliography_text:
+            messagebox.showinfo("Fetch Literature PDFs", "Paste bibliography text before downloading.")
+            return
+
+        entries = split_entries(bibliography_text)
+        if not entries:
+            messagebox.showinfo("Fetch Literature PDFs", "No bibliography entries were detected.")
+            return
+
+        output_dir = pathlib.Path(output_dir_var.get()).expanduser()
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Fetch Literature PDFs", f"Unable to create output directory: {exc}")
+            return
+
+        user_agent = user_agent_var.get().strip() or DEFAULT_USER_AGENT
+
+        download_button.configure(state="disabled")
+        append_status("")
+        append_status(f"Saving PDFs to: {output_dir}")
+
+        thread = threading.Thread(
+            target=worker, args=(entries, len(entries), output_dir, user_agent), daemon=True
+        )
+        thread.start()
+
+    def poll_queue() -> None:
+        try:
+            while True:
+                message = status_queue.get_nowait()
+                if message is None:
+                    download_button.configure(state="normal")
+                    append_status("Done.")
+                else:
+                    append_status(message)
+        except queue.Empty:
+            pass
+        finally:
+            root.after(100, poll_queue)
+
+    main_frame = tk.Frame(root, padx=10, pady=10)
+    main_frame.grid(row=0, column=0, sticky="nsew")
+
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+    main_frame.columnconfigure(1, weight=1)
+
+    tk.Label(main_frame, text="User-Agent (include your email):").grid(row=0, column=0, sticky="w")
+    user_agent_entry = tk.Entry(main_frame, textvariable=user_agent_var, width=60)
+    user_agent_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=(0, 10))
+
+    tk.Label(main_frame, text="Output directory:").grid(row=1, column=0, sticky="w")
+    output_entry = tk.Entry(main_frame, textvariable=output_dir_var, width=40)
+    output_entry.grid(row=1, column=1, sticky="ew")
+    browse_button = tk.Button(main_frame, text="Browse…", command=choose_directory)
+    browse_button.grid(row=1, column=2, padx=(5, 0), sticky="ew")
+
+    tk.Label(main_frame, text="Paste bibliography:").grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+    bibliography_text_widget = ScrolledText(main_frame, width=80, height=15)
+    bibliography_text_widget.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=(5, 10))
+
+    download_button = tk.Button(main_frame, text="Download PDFs", command=start_download)
+    download_button.grid(row=4, column=0, columnspan=3, sticky="ew")
+
+    tk.Label(main_frame, text="Status:").grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+    results_text = ScrolledText(main_frame, width=80, height=10, state="disabled")
+    results_text.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(5, 0))
+
+    main_frame.rowconfigure(3, weight=1)
+    main_frame.rowconfigure(6, weight=1)
+
+    poll_queue()
+    root.mainloop()
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+
+    if args.gui:
+        run_gui(args)
+        return 0
 
     bibliography_text = read_bibliography_text(args.bibliography)
     entries = split_entries(bibliography_text)

@@ -1,7 +1,9 @@
 # Fetch Literature PDFs
 
-This repository contains a command-line tool that reads a bibliography and
-automatically downloads available PDF files for the cited works.
+This repository contains tools that read a bibliography and automatically
+download available PDF files for the cited works. You can run the downloader
+either from the command line or through a small graphical interface for easy
+pasting.
 
 ## Features
 - Splits a pasted bibliography into individual citations.
@@ -37,6 +39,22 @@ Author, A. A. (2020). *Sample article*. Journal Name.
 ...
 END
 ```
+
+### Graphical interface
+Launch the GUI when you prefer to paste the bibliography into a window and
+watch the download progress message-by-message:
+
+```bash
+python fetch_pdfs.py --gui
+```
+
+Within the GUI you can:
+
+- Paste references into the large text box.
+- Choose the download directory with the “Browse…” button.
+- Customize the User-Agent string (remember to include your email address).
+- Monitor status updates for each citation, including messages when a PDF could
+  not be located.
 
 ### Useful options
 - `-o, --output-dir`: Directory where PDFs are saved (default: `downloads`).
