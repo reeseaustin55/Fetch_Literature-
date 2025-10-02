@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
@@ -36,6 +36,11 @@ from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.microsoft import EdgeChromiumDriverManager
 
 import requests
+
+
+EDGE_SHORTCUT_PATH = Path(
+    r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk"
+)
 
 
 DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
@@ -363,8 +368,31 @@ class DownloadApp:
             self.driver = build_driver(browser, folder)
         except WebDriverException as exc:
             self._log(f"Failed to initialise browser: {exc}")
-            messagebox.showerror("Browser error", f"Failed to start browser: {exc}")
-            return
+            if browser == "edge":
+                self._log("Prompting for Edge driver path…")
+                manual_path = self._prompt_edge_driver_path(str(exc))
+                if manual_path:
+                    os.environ["EDGE_DRIVER_PATH"] = str(manual_path)
+                    self._log(f"Retrying Edge setup with {manual_path}")
+                    try:
+                        self.driver = build_driver(browser, folder)
+                    except WebDriverException as retry_exc:
+                        self._log(f"Retry failed: {retry_exc}")
+                        messagebox.showerror(
+                            "Browser error",
+                            "Failed to start Edge even after providing a driver path.\n"
+                            f"Details:\n{retry_exc}",
+                        )
+                        return
+                else:
+                    messagebox.showerror(
+                        "Browser error",
+                        "Edge driver setup cancelled. Please supply a valid driver path to continue.",
+                    )
+                    return
+            else:
+                messagebox.showerror("Browser error", f"Failed to start browser: {exc}")
+                return
 
         success_count = 0
         try:
@@ -393,6 +421,67 @@ class DownloadApp:
         self.log_widget.insert(tk.END, entry)
         self.log_widget.configure(state=tk.DISABLED)
         self.log_widget.see(tk.END)
+
+    def _prompt_edge_driver_path(self, failure_reason: str) -> Optional[Path]:
+        """Ask the user to provide a path to the Edge driver executable."""
+
+        result: dict[str, Optional[Path]] = {"path": None}
+        completion = threading.Event()
+
+        def ask_user() -> None:
+            message = (
+                "Edge could not start because no driver executable was found.\n\n"
+                "Provide the full path to your Edge driver executable "
+                "(msedgedriver.exe). If you are unsure, start from the standard "
+                "Edge shortcut location:\n"
+                f"{EDGE_SHORTCUT_PATH}\n\n"
+                "You may browse for the executable or enter a path manually.\n\n"
+                f"Original error:\n{failure_reason}"
+            )
+            messagebox.showinfo("Locate Edge driver", message)
+
+            initial_dir = EDGE_SHORTCUT_PATH.parent if EDGE_SHORTCUT_PATH.exists() else Path.home()
+            selected = filedialog.askopenfilename(
+                title="Select Edge driver (msedgedriver.exe)",
+                initialdir=str(initial_dir),
+                filetypes=[
+                    ("Edge driver", "msedgedriver.exe"),
+                    ("Executable", "*.exe"),
+                    ("All files", "*.*"),
+                ],
+            )
+
+            if not selected:
+                entered = simpledialog.askstring(
+                    "Edge driver path",
+                    "Enter the full path to msedgedriver.exe:",
+                    initialvalue=str(EDGE_SHORTCUT_PATH),
+                )
+                selected = entered or ""
+
+            selected_path = Path(selected).expanduser() if selected else None
+            if selected_path and not selected_path.exists():
+                messagebox.showerror(
+                    "Invalid path",
+                    f"The provided path does not exist:\n{selected_path}",
+                )
+                result["path"] = None
+            elif selected_path and selected_path.suffix.lower() == ".lnk":
+                messagebox.showerror(
+                    "Shortcut selected",
+                    "The chosen item is a shortcut to Microsoft Edge. "
+                    "Please browse to the Edge driver executable "
+                    "(msedgedriver.exe).",
+                )
+                result["path"] = None
+            else:
+                result["path"] = selected_path
+
+            completion.set()
+
+        self.root.after(0, ask_user)
+        completion.wait()
+        return result["path"]
 
     def on_quit(self) -> None:
         if self.driver:

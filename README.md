@@ -44,7 +44,9 @@ download folder or browser if necessary, and click **Download PDFs**.
   installed on your system.  If automatic driver retrieval fails (for
   example, while offline), download the driver manually and either place it on
   your `PATH` or set the `EDGE_DRIVER_PATH` / `CHROME_DRIVER_PATH`
-  environment variables before launching the app.
+  environment variables before launching the app.  When Edge cannot start, the
+  GUI will prompt you to browse to your driver executable (for example, you
+  can start from `C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk`).
 - Access to full PDFs still depends on your institutional or personal
   subscription rights.  The script simply automates the same browser workflow
   you would otherwise perform manually.
