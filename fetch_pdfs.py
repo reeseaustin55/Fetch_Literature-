@@ -345,7 +345,7 @@ def run_gui(args: argparse.Namespace) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
-    if args.gui:
+    if args.gui or (args.bibliography is None and sys.stdin.isatty()):
         run_gui(args)
         return 0
 
