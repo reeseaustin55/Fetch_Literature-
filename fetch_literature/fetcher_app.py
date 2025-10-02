@@ -10,11 +10,18 @@ from typing import Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from .browser_automation import (
-    AutomationResult,
-    attempt_automated_pdf_download,
-    ensure_playwright_setup,
-)
+if __package__:
+    from .browser_automation import (
+        AutomationResult,
+        attempt_automated_pdf_download,
+        ensure_playwright_setup,
+    )
+else:  # When executed as a stand-alone script.
+    from fetch_literature.browser_automation import (
+        AutomationResult,
+        attempt_automated_pdf_download,
+        ensure_playwright_setup,
+    )
 
 logger = logging.getLogger(__name__)
 
