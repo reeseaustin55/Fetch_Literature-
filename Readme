@@ -1,1 +1,50 @@
-temp
+# Fetch Literature
+
+A minimal desktop helper for collecting bibliography PDFs using manual selection or a
+scriptable browser.
+
+## How it works
+
+1. Launch the application and paste the article URL in the **Article URL** field.
+2. Pick a downloads folder, then decide how you want to grab the PDF:
+   - Leave **Attempt automatic PDF download** unchecked to follow the existing flow.
+     The app will open a file picker so you can select the PDF that you downloaded
+     manually in your regular browser.
+   - Check **Attempt automatic PDF download** to let the helper spin up a Playwright
+     browser session. After the page loads you have a short window to complete any
+     authentication, and the helper will then try to click common “PDF” or
+     “Download” buttons automatically. When a download succeeds the file is saved to
+     the configured downloads folder and the manual picker is skipped.
+3. If automation cannot run (for example, Playwright is not installed) or fails to
+   find a PDF link, the application falls back to the manual dialog so you can select
+   the file yourself.
+
+## Installation
+
+```bash
+pip install playwright           # install the automation runtime
+playwright install chromium      # download the controllable Chromium browser
+```
+
+Tkinter ships with the CPython standard library on most platforms. If your Python
+distribution omits it, install the appropriate OS-specific package.
+
+## Configuration
+
+- **Default downloads directory:** set in code via `FetcherConfig` or by browsing to a
+  folder in the UI. The application remembers the folder for the current session.
+- **Automatic download toggle:** exposed as a checkbox in the UI and can be set
+  programmatically with `FetcherConfig(automation_default=True)` for deployments where
+  Playwright is guaranteed to be available.
+- **Browser choice:** the automation helper defaults to Playwright’s Chromium engine.
+  You can call `attempt_automated_pdf_download(..., browser="firefox")` if you need a
+  different backend.
+
+## Development
+
+```bash
+python -m compileall fetch_literature
+```
+
+The `browser_automation.py` helper uses Playwright’s async APIs; consult the Playwright
+[Python documentation](https://playwright.dev/python/) for additional selector ideas.
