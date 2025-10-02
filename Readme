@@ -5,22 +5,24 @@ scriptable browser.
 
 ## How it works
 
-1. Launch the application and paste the article URL in the **Article URL** field.
+1. Launch the application and paste your bibliography entries (including the DOIs or
+   article links) into the **Bibliography entries** text box.
 2. Click **Prepare automation dependencies** if you want the in-app helper to install
    Playwright and the bundled Chromium browser into the interpreter that is currently
    running the GUI (no external terminal required). The button is safe to press even
    if everything is already installed—it simply verifies the setup.
 3. Pick a downloads folder, then decide how you want to grab the PDF:
    - Leave **Attempt automatic PDF download** unchecked to follow the existing flow.
-     The app will open a file picker so you can select the PDF that you downloaded
-     manually in your regular browser.
+     After you download the bibliography PDF manually, the app will open a file picker
+     so you can select the file from the chosen downloads folder.
    - Check **Attempt automatic PDF download** to let the helper spin up a Playwright
-     browser session. After the page loads you have a short window to complete any
-     authentication, and the helper will then try to click common “PDF” or
-     “Download” buttons automatically. When a download succeeds the file is saved to
-     the configured downloads folder and the manual picker is skipped.
-4. If automation cannot run or fails to find a PDF link, the application falls back
-   to the manual dialog so you can select the file yourself.
+     browser session. It will walk through every link discovered in the bibliography,
+     waiting briefly for you to complete authentication if needed, and then try to
+     click common “PDF” or “Download” buttons automatically. When a download succeeds
+     the file is saved to the configured downloads folder and the manual picker is
+     skipped.
+4. If automation cannot run or fails to find a PDF link for every entry, the
+   application falls back to the manual dialog so you can select the file yourself.
 
 ## Installation
 

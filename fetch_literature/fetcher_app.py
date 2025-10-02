@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -41,7 +42,6 @@ class FetcherApp:
         self.root = root
         self.config = config or FetcherConfig()
 
-        self.url_var = tk.StringVar()
         self.download_dir_var = tk.StringVar(value=str(self.config.default_download_dir))
         self.automation_enabled = tk.BooleanVar(value=self.config.automation_default)
         self.status_var = tk.StringVar(value="Ready")
@@ -59,11 +59,14 @@ class FetcherApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        ttk.Label(container, text="Article URL:").grid(column=0, row=0, sticky="w")
-        ttk.Entry(container, textvariable=self.url_var, width=60).grid(
-            column=1, row=0, columnspan=2, sticky="ew", padx=(8, 0)
-        )
+        ttk.Label(container, text="Bibliography entries:").grid(column=0, row=0, sticky="nw")
+        self.bibliography_text = tk.Text(container, width=60, height=12, wrap="word")
+        self.bibliography_text.grid(column=1, row=0, columnspan=2, sticky="nsew", padx=(8, 0))
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=self.bibliography_text.yview)
+        scrollbar.grid(column=3, row=0, sticky="nsw")
+        self.bibliography_text.configure(yscrollcommand=scrollbar.set)
         container.columnconfigure(1, weight=1)
+        container.rowconfigure(0, weight=1)
 
         ttk.Label(container, text="Downloads folder:").grid(column=0, row=1, sticky="w", pady=(8, 0))
         ttk.Entry(container, textvariable=self.download_dir_var, width=60).grid(
@@ -99,38 +102,61 @@ class FetcherApp:
     def download_bibliography(self) -> Optional[Path]:
         """Download the bibliography PDF using automation when available."""
 
-        url = self.url_var.get().strip()
-        if not url:
-            messagebox.showerror("Missing URL", "Please enter the article URL before downloading.")
+        bibliography_text = self.bibliography_text.get("1.0", tk.END).strip()
+        if not bibliography_text:
+            messagebox.showerror("Missing bibliography", "Paste one or more bibliography entries before downloading.")
+            return None
+
+        candidate_urls = self._extract_candidate_urls(bibliography_text)
+        if not candidate_urls:
+            messagebox.showerror(
+                "No links found",
+                "Could not locate any URLs or DOIs in the bibliography.\n"
+                "Ensure each entry includes a link such as https://doi.org/...",
+            )
             return None
 
         download_dir = Path(self.download_dir_var.get()).expanduser().resolve()
         download_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.debug("Initiating download for %s", url)
+        logger.debug("Initiating download for %d candidate URLs", len(candidate_urls))
 
         if self.automation_enabled.get():
-            result: AutomationResult = attempt_automated_pdf_download(
-                candidate_url=url,
-                download_dir=download_dir,
-            )
-            if result.path:
-                self.status_var.set(f"Downloaded automatically: {result.path}")
-                messagebox.showinfo("Download complete", f"Automatically downloaded PDF to {result.path}")
-                return result.path
+            automation_errors: list[str] = []
+            for url in candidate_urls:
+                self.status_var.set(f"Attempting automatic download for: {url}")
+                self.root.update_idletasks()
+                result: AutomationResult = attempt_automated_pdf_download(
+                    candidate_url=url,
+                    download_dir=download_dir,
+                )
+                if result.path:
+                    self.status_var.set(f"Downloaded automatically: {result.path}")
+                    messagebox.showinfo(
+                        "Download complete",
+                        "Automatically downloaded PDF to\n"
+                        f"{result.path}\n\nSource link:\n{url}",
+                    )
+                    return result.path
 
-            if result.attempted:
-                details = result.error or "Unable to locate a PDF link automatically."
+                if result.attempted and result.error:
+                    automation_errors.append(f"{url}: {result.error}")
+                elif result.attempted:
+                    automation_errors.append(f"{url}: Unable to locate a PDF link automatically.")
+                elif result.error:
+                    automation_errors.append(f"{url}: {result.error}")
+
+            if automation_errors:
                 messagebox.showwarning(
                     "Automatic download unavailable",
-                    f"The automated browser could not complete the download.\n\n{details}\n"
-                    "Please use the manual file picker instead.",
+                    "The automated browser could not download any PDFs.\n\n"
+                    + "\n".join(automation_errors)
+                    + "\n\nPlease use the manual file picker instead.",
                 )
-            elif result.error:
+            else:
                 messagebox.showinfo(
-                    "Automation not available",
-                    f"Automatic downloads were skipped because: {result.error}\n"
-                    "The manual file picker will be shown instead.",
+                    "Automation skipped",
+                    "Automatic downloads were skipped. The manual file picker will be shown instead.",
                 )
 
         selected_path = self.request_manual_download(download_dir)
@@ -139,6 +165,19 @@ class FetcherApp:
         else:
             self.status_var.set("No PDF selected yet")
         return selected_path
+
+    def _extract_candidate_urls(self, bibliography_text: str) -> list[str]:
+        """Return a list of HTTP(S) links discovered in *bibliography_text*."""
+
+        pattern = re.compile(r"https?://[^\s<>\]]+")
+        found = []
+        seen = set()
+        for match in pattern.findall(bibliography_text):
+            cleaned = match.rstrip(".,);]\"")
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                found.append(cleaned)
+        return found
 
     def request_manual_download(self, download_dir: Path) -> Optional[Path]:
         """Prompt the user to manually choose a downloaded bibliography file."""
