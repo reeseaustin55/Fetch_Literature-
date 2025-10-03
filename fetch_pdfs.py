@@ -140,6 +140,14 @@ class DownloadResult:
     destination: Optional[Path] = None
 
 
+@dataclass
+class ReferenceTask:
+    index: int
+    reference: str
+    output_name: str
+    preview: str
+
+
 def create_failure_report(destination: Path, failures: List["DownloadResult"]) -> Optional[Path]:
     """Write a text document listing references that did not download."""
 
@@ -167,6 +175,15 @@ def _dedupe_path(path: Path) -> Path:
         final_path = path.with_name(f"{path.stem}_{counter}{path.suffix}")
         counter += 1
     return final_path
+
+
+def _merge_failure_messages(initial: str, retry: str) -> str:
+    parts: List[str] = []
+    if initial:
+        parts.append(f"initial attempt: {initial}")
+    if retry:
+        parts.append(f"retry attempt: {retry}")
+    return "; ".join(parts) if parts else ""
 
 
 class PDFDownloader:
@@ -445,30 +462,80 @@ class App(tk.Tk):
 
     def _run_downloads(self, references: List[str], destination: Path) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="fetch_pdfs_"))
-        results: List[DownloadResult] = []
+        tasks: List[ReferenceTask] = []
+        for index, reference in enumerate(references, start=1):
+            title = derive_title(reference)
+            sanitized_title = _sanitize_filename(title)[:150] if title else ""
+            output_name = sanitized_title if sanitized_title else f"reference_{index:03d}"
+            preview = reference if len(reference) <= 80 else reference[:77] + "..."
+            tasks.append(ReferenceTask(index, reference, output_name, preview))
+
+        final_results: List[Optional[DownloadResult]] = [None] * len(tasks)
+        retry_successes: List[ReferenceTask] = []
+        retry_candidates: List[tuple[int, ReferenceTask, DownloadResult]] = []
+
         try:
             self.downloader = PDFDownloader(temp_dir)
-            for index, reference in enumerate(references, start=1):
-                title = derive_title(reference)
-                sanitized_title = _sanitize_filename(title)[:150] if title else ""
-                output_name = (
-                    sanitized_title if sanitized_title else f"reference_{index:03d}"
+            for task in tasks:
+                self._update_status(
+                    f"Processing {task.index}/{len(references)}: {task.preview}"
                 )
-                preview = reference if len(reference) <= 80 else reference[:77] + "..."
-                self._update_status(f"Processing {index}/{len(references)}: {preview}")
-                result = self.downloader.download(reference, output_name, destination)
-                results.append(result)
+                result = self.downloader.download(
+                    task.reference, task.output_name, destination
+                )
+                final_results[task.index - 1] = result
+                if not result.success:
+                    retry_candidates.append((task.index - 1, task, result))
+
+            if retry_candidates:
+                self._update_status(
+                    f"Retrying {len(retry_candidates)} reference(s) that failed initially..."
+                )
+                for slot, task, first_result in retry_candidates:
+                    self._update_status(
+                        f"Retrying {task.index}/{len(references)}: {task.preview}"
+                    )
+                    retry_result = self.downloader.download(
+                        task.reference, task.output_name, destination
+                    )
+                    if retry_result.success:
+                        retry_result.message = "Downloaded on retry"
+                        final_results[slot] = retry_result
+                        retry_successes.append(task)
+                    else:
+                        retry_result.message = _merge_failure_messages(
+                            first_result.message, retry_result.message
+                        )
+                        final_results[slot] = retry_result
         except Exception as exc:  # pragma: no cover - GUI feedback only
-            results.append(DownloadResult("Initialization", False, str(exc)))
+            error_message = str(exc)
+            for idx, value in enumerate(final_results):
+                if isinstance(value, DownloadResult):
+                    continue
+                reference = tasks[idx].reference if idx < len(tasks) else "Initialization"
+                final_results[idx] = DownloadResult(reference, False, error_message)
+            if not final_results:
+                final_results = [DownloadResult("Initialization", False, error_message)]
+            retry_successes = []
         finally:
             if self.downloader:
                 self.downloader.close()
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+        results: List[DownloadResult]
+        if final_results and all(isinstance(r, DownloadResult) for r in final_results):
+            results = [r for r in final_results if isinstance(r, DownloadResult)]
+        else:
+            results = [DownloadResult("Initialization", False, "Downloader did not start")]  # pragma: no cover
+
         success = sum(1 for r in results if r.success)
         failures = [r for r in results if not r.success]
 
         summary_lines = [f"Downloaded {success} of {len(references)} references."]
+        if retry_successes:
+            summary_lines.append(
+                f"{len(retry_successes)} reference(s) succeeded on a second attempt."
+            )
         for fail in failures:
             summary_lines.append(f"- {fail.target}: {fail.message}")
 
