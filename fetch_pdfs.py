@@ -140,6 +140,35 @@ class DownloadResult:
     destination: Optional[Path] = None
 
 
+def create_failure_report(destination: Path, failures: List["DownloadResult"]) -> Optional[Path]:
+    """Write a text document listing references that did not download."""
+
+    if not failures:
+        return None
+
+    destination.mkdir(parents=True, exist_ok=True)
+    report_path = _dedupe_path(destination / "missing_pdfs.txt")
+
+    lines: List[str] = []
+    for idx, failure in enumerate(failures, start=1):
+        lines.append(f"{idx}. {failure.target}")
+        if failure.message:
+            lines.append(f"   Reason: {failure.message}")
+        lines.append("")
+
+    report_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+    return report_path
+
+
+def _dedupe_path(path: Path) -> Path:
+    counter = 1
+    final_path = path
+    while final_path.exists():
+        final_path = path.with_name(f"{path.stem}_{counter}{path.suffix}")
+        counter += 1
+    return final_path
+
+
 class PDFDownloader:
     """Handles Selenium browser automation to download PDF files via Google Scholar."""
 
@@ -336,12 +365,7 @@ class PDFDownloader:
 
     @staticmethod
     def _dedupe_destination(path: Path) -> Path:
-        counter = 1
-        final_path = path
-        while final_path.exists():
-            final_path = path.with_name(f"{path.stem}_{counter}{path.suffix}")
-            counter += 1
-        return final_path
+        return _dedupe_path(path)
 
 
 class App(tk.Tk):
@@ -447,6 +471,13 @@ class App(tk.Tk):
         summary_lines = [f"Downloaded {success} of {len(references)} references."]
         for fail in failures:
             summary_lines.append(f"- {fail.target}: {fail.message}")
+
+        report_path = create_failure_report(destination, failures)
+        if report_path:
+            summary_lines.append("")
+            summary_lines.append(
+                f"A list of missed PDFs was saved to: {report_path}"
+            )
 
         self._finish(summary_lines)
 

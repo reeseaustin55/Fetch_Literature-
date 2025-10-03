@@ -26,6 +26,8 @@ pip install selenium
 2. Paste bibliography entries into the text box. Entries can be separated by blank lines **or** by numbering such as `[1]`, `(2)`, or `3.`—the parser will split them accordingly.
 3. Choose the destination folder for the downloaded PDFs (defaults to a folder on your Desktop).
 4. Click **Download PDFs**. The application will launch Firefox, search each reference on Google Scholar, follow the first result, download the associated PDF, and save it into the chosen folder. Each file is named after the detected study title when possible (falling back to a numeric sequence otherwise).
-5. When finished, a summary dialog displays the results.
+5. When finished, a summary dialog displays the results. If any PDFs could not be
+   downloaded, a `missing_pdfs.txt` report is written to the destination folder
+   listing the references and the reason they were skipped.
 
 Downloads occur through Firefox so they retain any session-based access you have in your browser profile.
