@@ -87,6 +87,12 @@ SCHOLAR_ARTICLE_LINK_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+SCHOLAR_TITLE_HTML_PATTERN = re.compile(
+    r"<h3 class=\"gs_rt\"[^>]*>(.*?)</h3>", re.IGNORECASE | re.DOTALL
+)
+
+HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+
 
 PDF_MERGER_AVAILABLE = PdfMerger is not None
 
@@ -328,6 +334,7 @@ class DownloadResult:
     success: bool
     message: str
     destination: Optional[Path] = None
+    used_filename: Optional[str] = None
 
 
 @dataclass
@@ -344,6 +351,7 @@ class ManualTargets:
     query_url: str
     article_url: Optional[str]
     pdf_url: Optional[str]
+    title: Optional[str] = None
 
 
 def create_failure_report(destination: Path, failures: List["DownloadResult"]) -> Optional[Path]:
@@ -498,9 +506,12 @@ def _make_absolute_url(url: str, base: str) -> str:
     return url
 
 
-def _parse_manual_targets(html: str, base: str) -> Tuple[Optional[str], Optional[str]]:
+def _parse_manual_targets(
+    html: str, base: str
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     pdf_url: Optional[str] = None
     article_url: Optional[str] = None
+    title: Optional[str] = None
 
     pdf_match = SCHOLAR_PDF_LINK_PATTERN.search(html)
     if pdf_match:
@@ -510,7 +521,19 @@ def _parse_manual_targets(html: str, base: str) -> Tuple[Optional[str], Optional
     if article_match:
         article_url = _make_absolute_url(unescape(article_match.group(1).strip()), base)
 
-    return pdf_url, article_url
+    title_match = SCHOLAR_TITLE_HTML_PATTERN.search(html)
+    if title_match:
+        fragment = unescape(title_match.group(1))
+        fragment = HTML_TAG_PATTERN.sub(" ", fragment)
+        fragment = re.sub(r"\s+", " ", fragment).strip()
+        while True:
+            cleaned = re.sub(r"^\[[^\]]+\]\s*", "", fragment).strip()
+            if cleaned == fragment:
+                break
+            fragment = cleaned
+        title = fragment or None
+
+    return pdf_url, article_url, title
 
 
 def resolve_manual_targets(reference: str, timeout: float = 10.0) -> ManualTargets:
@@ -532,8 +555,8 @@ def resolve_manual_targets(reference: str, timeout: float = 10.0) -> ManualTarge
     if page_requires_verification(html_text, query_url):
         return ManualTargets(query_url, None, None)
 
-    pdf_url, article_url = _parse_manual_targets(html_text, SCHOLAR_BASE_URL)
-    return ManualTargets(query_url, article_url, pdf_url)
+    pdf_url, article_url, title = _parse_manual_targets(html_text, SCHOLAR_BASE_URL)
+    return ManualTargets(query_url, article_url, pdf_url, title)
 
 
 class SkipRequested(Exception):
@@ -604,6 +627,8 @@ class PDFDownloader:
             return DownloadResult(reference, False, "Skipped by user")
         except TimeoutException:
             return DownloadResult(reference, False, "No Google Scholar results were found")
+
+        result_title = self._extract_result_title_text(result_block)
 
         try:
             pdf_link = self._extract_pdf_link(result_block)
@@ -687,10 +712,19 @@ class PDFDownloader:
 
         self._close_extra_tabs()
 
-        destination = final_dir / f"{output_name}.pdf"
+        sanitized_title = _sanitize_filename(result_title)[:150] if result_title else ""
+        final_name = sanitized_title if sanitized_title else output_name
+
+        destination = final_dir / f"{final_name}.pdf"
         destination = self._dedupe_destination(destination)
         shutil.move(str(downloaded), destination)
-        return DownloadResult(reference, True, "Downloaded", destination)
+        return DownloadResult(
+            reference,
+            True,
+            "Downloaded",
+            destination,
+            used_filename=destination.stem,
+        )
 
     def _search_reference(
         self, reference: str, skip_event: Optional[threading.Event] = None
@@ -756,6 +790,26 @@ class PDFDownloader:
             return result_block.find_element(By.CSS_SELECTOR, "div.gs_or_ggsm a")
         except NoSuchElementException:
             return None
+
+    @staticmethod
+    def _extract_result_title_text(result_block) -> str:
+        try:
+            title_element = result_block.find_element(By.CSS_SELECTOR, "h3")
+        except NoSuchElementException:
+            return ""
+
+        raw_text = (title_element.text or "").strip()
+        if not raw_text:
+            raw_text = (title_element.get_attribute("textContent") or "").strip()
+
+        normalized = re.sub(r"\s+", " ", raw_text).strip()
+        while True:
+            cleaned = re.sub(r"^\[[^\]]+\]\s*", "", normalized).strip()
+            if cleaned == normalized:
+                break
+            normalized = cleaned
+
+        return normalized
 
     def _open_article_link(
         self, link, skip_event: Optional[threading.Event] = None
@@ -1084,6 +1138,7 @@ class App(tk.Tk):
                             original_result.success,
                             message,
                             original_result.destination,
+                            used_filename=original_result.used_filename,
                         )
                     else:
                         final_results[task.index - 1] = DownloadResult(
@@ -1388,7 +1443,13 @@ class App(tk.Tk):
                 ),
             )
 
-        destination_path = _dedupe_path(destination / f"{task.output_name}.pdf")
+        preferred_name = task.output_name
+        if targets.title:
+            sanitized = _sanitize_filename(targets.title)[:150]
+            if sanitized:
+                preferred_name = sanitized
+
+        destination_path = _dedupe_path(destination / f"{preferred_name}.pdf")
         try:
             shutil.move(str(manual_file), destination_path)
         except OSError as exc:
@@ -1401,7 +1462,11 @@ class App(tk.Tk):
             )
 
         return DownloadResult(
-            task.reference, True, "Downloaded manually", destination_path
+            task.reference,
+            True,
+            "Downloaded manually",
+            destination_path,
+            used_filename=destination_path.stem,
         )
 
     def _prompt_manual_confirmation(
