@@ -255,6 +255,10 @@ def build_search_query(reference: str) -> str:
 
     components: List[str] = []
 
+    normalized_reference = re.sub(r"\s+", " ", cleaned).strip()
+    if normalized_reference:
+        components.append(f'"{normalized_reference}"')
+
     title = derive_title(reference).strip()
     title_is_valid = (
         bool(title)
