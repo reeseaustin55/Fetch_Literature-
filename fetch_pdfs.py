@@ -257,7 +257,7 @@ def build_search_query(reference: str) -> str:
 
     normalized_reference = re.sub(r"\s+", " ", cleaned).strip()
     if normalized_reference:
-        components.append(f'"{normalized_reference}"')
+        components.append(normalized_reference)
 
     title = derive_title(reference).strip()
     title_is_valid = (
@@ -267,11 +267,11 @@ def build_search_query(reference: str) -> str:
         and not re.match(r"^[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'`-]+,?\s*[A-Z]?\.?$", title)
     )
     if title_is_valid:
-        components.append(f'"{title}"')
+        components.append(title)
 
     journal = _extract_journal(reference)
     if journal and (not title_is_valid or journal.lower() not in title.lower()):
-        components.append(f'"{journal}"')
+        components.append(journal)
 
     year_match = YEAR_PATTERN.search(cleaned)
     if year_match:
@@ -280,7 +280,7 @@ def build_search_query(reference: str) -> str:
     pages_match = PAGES_PATTERN.search(cleaned)
     if pages_match:
         page_token = pages_match.group(1).replace(" ", "")
-        components.append(f'"{page_token}"')
+        components.append(page_token)
 
     author_last_name = _extract_first_author(reference)
     if author_last_name:
