@@ -49,7 +49,10 @@ else:  # pragma: no cover - executed only when PyPDF2 is unavailable
     PdfMerger = None  # type: ignore
 
 
-REFERENCE_LEAD_PATTERN = re.compile(r"^\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*")
+REFERENCE_LEAD_PATTERN = re.compile(r"^\s*(?:\[\d+\]|\(\d+\)|\d+[.)])\s*")
+LOOSE_REFERENCE_LEAD_PATTERN = re.compile(
+    r"^\s*\d+\s+(?=.*[A-Za-zÀ-ÖØ-öø-ÿ])"
+)
 DOI_PATTERN = re.compile(r"10\.\d{4,9}/[^\s\"<>]+", re.IGNORECASE)
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 
@@ -98,14 +101,22 @@ def page_requires_verification(page_source: str, current_url: str = "") -> bool:
     return False
 
 
+def _strip_reference_lead(text: str) -> str:
+    """Remove numbering prefixes such as "[2]", "3.", or "4 Authors"."""
+
+    stripped = REFERENCE_LEAD_PATTERN.sub("", text, count=1).strip()
+    stripped = LOOSE_REFERENCE_LEAD_PATTERN.sub("", stripped, count=1).strip()
+    return stripped
+
+
 def extract_references(text: str) -> List[str]:
     """Split raw bibliography text into distinct references.
 
     The parser groups contiguous non-empty lines, but also treats new numbering tokens
-    (e.g. "[12]", "(3)", or "4.") as the start of a fresh reference even when
-    references are provided without blank lines between them. Leading numbering
-    markers are stripped from the resulting reference text to improve search
-    results.
+    (e.g. "[12]", "(3)", "4.", or "5 Authors...") as the start of a fresh reference
+    even when references are provided without blank lines between them. Leading
+    numbering markers are stripped from the resulting reference text to improve
+    search results.
     """
 
     references: List[str] = []
@@ -119,11 +130,16 @@ def extract_references(text: str) -> List[str]:
                 current = []
             continue
 
-        if REFERENCE_LEAD_PATTERN.match(stripped):
+        lead_match = REFERENCE_LEAD_PATTERN.match(stripped)
+        loose_match = None
+        if not lead_match:
+            loose_match = LOOSE_REFERENCE_LEAD_PATTERN.match(stripped)
+
+        if lead_match or loose_match:
             if current:
                 references.append(" ".join(current))
                 current = []
-            stripped = REFERENCE_LEAD_PATTERN.sub("", stripped, count=1).strip()
+            stripped = _strip_reference_lead(stripped)
 
         current.append(stripped)
 
@@ -153,7 +169,7 @@ TITLE_PATTERN = re.compile(r"\.\s+([A-Z][^.]+?)\.\s+[A-Z]")
 def derive_title(reference: str) -> str:
     """Attempt to extract the study title from a reference string."""
 
-    cleaned = REFERENCE_LEAD_PATTERN.sub("", reference).strip()
+    cleaned = _strip_reference_lead(reference)
     if not cleaned:
         return ""
 
@@ -200,7 +216,7 @@ def _strip_trailing_punctuation(value: str) -> str:
 def build_reference_signature(reference: str, title: str = "") -> Optional[str]:
     """Generate a normalized token used to detect duplicate references."""
 
-    cleaned = REFERENCE_LEAD_PATTERN.sub("", reference).strip()
+    cleaned = _strip_reference_lead(reference)
     if not cleaned:
         return None
 
