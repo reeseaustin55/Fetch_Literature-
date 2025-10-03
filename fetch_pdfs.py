@@ -658,7 +658,7 @@ class App(tk.Tk):
         self.download_thread: Optional[threading.Thread] = None
         self.downloader: Optional[PDFDownloader] = None
         self._skip_event = threading.Event()
-        self.manual_retry_var = tk.BooleanVar(value=False)
+        self.manual_retry_var = tk.BooleanVar(value=True)
         self._manual_prompt_acknowledged = False
         self._build_ui()
 
@@ -689,7 +689,7 @@ class App(tk.Tk):
         tk.Label(path_frame, text="Download timeout (seconds):").grid(
             row=1, column=0, sticky="w"
         )
-        self.timeout_var = tk.StringVar(value="30")
+        self.timeout_var = tk.StringVar(value="5")
         self.timeout_entry = tk.Entry(path_frame, textvariable=self.timeout_var, width=10)
         self.timeout_entry.grid(row=1, column=1, sticky="w", padx=5, pady=(0, 5))
 
