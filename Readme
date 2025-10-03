@@ -24,14 +24,15 @@ pip install selenium PyPDF2
    ```
 
 2. Paste bibliography entries into the text box. Entries can be separated by blank lines **or** by numbering such as `[1]`, `(2)`, or `3.`—the parser will split them accordingly.
-3. Choose the destination folder for the downloaded PDFs (defaults to a folder on your Desktop) and, if desired, adjust the per-reference download timeout (5 seconds by default). The **Offer manual browser fallback for missed PDFs** option is enabled by default so stubborn downloads automatically fall back to your own browser, but you can clear the checkbox if you prefer a fully automated run.
+3. Choose the destination folder for the downloaded PDFs (defaults to a folder on your Desktop) and, if desired, adjust the per-reference download timeout (10 seconds by default). The **Offer manual browser fallback for missed PDFs** option is enabled by default so stubborn downloads automatically fall back to your own browser, but you can clear the checkbox if you prefer a fully automated run.
 4. Click **Download PDFs**. The application will launch Firefox, search each reference on Google Scholar, follow the first result, download the associated PDF, and save it into the chosen folder. Each file is named after the detected study title when possible (falling back to a numeric sequence otherwise). Use the **Skip ▶** control if you need to manually advance to the next reference without waiting for the active attempt to finish.
    - If Google Scholar interrupts with a verification step (for example an “I'm not a robot” challenge), the app pauses and shows a dialog. Complete the verification manually in Firefox and press **OK** to continue.
 5. When finished, a summary dialog displays the results. Any references that fail
    on the first pass are automatically retried once more before the summary is
-   shown. If any PDFs still cannot be downloaded, a `missing_pdfs.txt` report is
-   written to the destination folder listing the references and the reason they
-   were skipped. Successful downloads are also stitched together into a
+   shown. Empty PDFs are treated as failures so they can be handed off to the
+   manual workflow. If any PDFs still cannot be downloaded, a `missing_pdfs.txt`
+   report is written to the destination folder listing the references and the
+   reason they were skipped. Successful downloads are also stitched together into a
    `combined_references.pdf` file in the destination folder when `PyPDF2` is
    available.
 
@@ -43,9 +44,9 @@ pip install selenium PyPDF2
      manual fallback runs during a session.
    - With the **Try to auto-open the first PDF when manual fallback runs**
      checkbox (enabled by default), the tool fetches the first Google Scholar
-     result in the background and attempts to open the associated PDF or article
-     link for you. If that automated lookup fails, it falls back to showing the
-     standard Google Scholar results page so you can complete the download
-     yourself.
+     result in the background and attempts to open the associated PDF and
+     article links for you. If that automated lookup fails, it falls back to
+     showing the standard Google Scholar results page so you can complete the
+     download yourself.
 
 Downloads occur through Firefox so they retain any session-based access you have in your browser profile.

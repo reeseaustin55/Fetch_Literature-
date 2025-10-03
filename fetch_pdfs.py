@@ -379,7 +379,9 @@ def _parse_manual_targets(html: str, base: str) -> Tuple[Optional[str], Optional
 
 
 def resolve_manual_targets(reference: str, timeout: float = 10.0) -> ManualTargets:
-    query_url = f"{SCHOLAR_BASE_URL}/scholar?q={quote_plus(reference)}"
+    query_url = (
+        f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q={quote_plus(reference)}"
+    )
 
     try:
         request = Request(query_url, headers={"User-Agent": SCHOLAR_USER_AGENT})
@@ -517,6 +519,30 @@ class PDFDownloader:
             return DownloadResult(reference, False, "Skipped by user")
         if downloaded is None:
             return DownloadResult(reference, False, "Download did not complete in time")
+
+        try:
+            downloaded_size = downloaded.stat().st_size
+        except OSError as exc:
+            try:
+                downloaded.unlink()
+            except OSError:
+                pass
+            return DownloadResult(
+                reference,
+                False,
+                f"Could not read downloaded PDF ({exc})",
+            )
+
+        if downloaded_size == 0:
+            try:
+                downloaded.unlink()
+            except OSError:
+                pass
+            return DownloadResult(
+                reference,
+                False,
+                "Downloaded PDF was empty",
+            )
 
         if article_opened_in_new_tab and article_handle:
             self._close_tab(article_handle)
@@ -763,7 +789,7 @@ class App(tk.Tk):
         tk.Label(path_frame, text="Download timeout (seconds):").grid(
             row=1, column=0, sticky="w"
         )
-        self.timeout_var = tk.StringVar(value="5")
+        self.timeout_var = tk.StringVar(value="10")
         self.timeout_entry = tk.Entry(path_frame, textvariable=self.timeout_var, width=10)
         self.timeout_entry.grid(row=1, column=1, sticky="w", padx=5, pady=(0, 5))
 
@@ -1066,26 +1092,24 @@ class App(tk.Tk):
         opened = False
 
         if self.manual_auto_var.get():
+            auto_targets: List[Tuple[str, str]] = []
             if targets.pdf_url:
+                auto_targets.append(("PDF", targets.pdf_url))
+            if targets.article_url and targets.article_url != targets.pdf_url:
+                auto_targets.append(("article", targets.article_url))
+
+            for label, url in auto_targets:
                 self._update_status(
-                    "Opening detected PDF link in default browser..."
+                    f"Opening detected {label.lower()} link in default browser..."
                 )
                 try:
-                    webbrowser.open_new_tab(targets.pdf_url)
+                    webbrowser.open_new_tab(url)
                     opened = True
-                    auto_notes.append("Opened PDF link automatically")
+                    auto_notes.append(f"Opened {label.lower()} link automatically")
                 except Exception as exc:  # pragma: no cover - OS/browser specific
-                    auto_notes.append(f"Automatic PDF open failed ({exc})")
-            elif targets.article_url:
-                self._update_status(
-                    "Opening detected article link in default browser..."
-                )
-                try:
-                    webbrowser.open_new_tab(targets.article_url)
-                    opened = True
-                    auto_notes.append("Opened article link automatically")
-                except Exception as exc:  # pragma: no cover - OS/browser specific
-                    auto_notes.append(f"Automatic article open failed ({exc})")
+                    auto_notes.append(
+                        f"Automatic {label.lower()} open failed ({exc})"
+                    )
 
         if not opened:
             try:
@@ -1131,6 +1155,35 @@ class App(tk.Tk):
                 False,
                 self._append_manual_note(
                     previous_message, "Manual fallback timed out"
+                ),
+            )
+
+        try:
+            manual_size = manual_file.stat().st_size
+        except OSError as exc:
+            try:
+                manual_file.unlink()
+            except OSError:
+                pass
+            return DownloadResult(
+                task.reference,
+                False,
+                self._append_manual_note(
+                    previous_message,
+                    f"Manual download could not be read ({exc})",
+                ),
+            )
+
+        if manual_size == 0:
+            try:
+                manual_file.unlink()
+            except OSError:
+                pass
+            return DownloadResult(
+                task.reference,
+                False,
+                self._append_manual_note(
+                    previous_message, "Manual download appeared empty",
                 ),
             )
 
