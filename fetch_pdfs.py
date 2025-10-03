@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 import re
 import unicodedata
@@ -38,6 +38,29 @@ else:  # pragma: no cover - executed only when selenium is unavailable
 
 
 REFERENCE_LEAD_PATTERN = re.compile(r"^\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*")
+
+CHALLENGE_KEYWORDS = (
+    "i'm not a robot",
+    "not a robot",
+    "unusual traffic",
+    "recaptcha",
+    "press and hold",
+    "complete the captcha",
+)
+
+
+def page_requires_verification(page_source: str, current_url: str = "") -> bool:
+    """Best-effort detection for verification/captcha interruptions."""
+
+    source_lower = page_source.lower()
+    if any(keyword in source_lower for keyword in CHALLENGE_KEYWORDS):
+        return True
+
+    url_lower = current_url.lower()
+    if "sorry/index" in url_lower and "scholar.google" in url_lower:
+        return True
+
+    return False
 
 
 def extract_references(text: str) -> List[str]:
@@ -190,8 +213,13 @@ class PDFDownloader:
     """Handles Selenium browser automation to download PDF files via Google Scholar."""
 
     SCHOLAR_URL = "https://scholar.google.com/"
+    CHALLENGE_TIMEOUT = 180
 
-    def __init__(self, download_dir: Path) -> None:
+    def __init__(
+        self,
+        download_dir: Path,
+        challenge_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
         if webdriver is None:
             raise RuntimeError(
                 "Selenium is not available. Please install it via 'pip install selenium' "
@@ -200,6 +228,7 @@ class PDFDownloader:
         self.download_dir = download_dir
         self.driver = self._create_driver(download_dir)
         self.base_handle = self.driver.current_window_handle
+        self.challenge_callback = challenge_callback
 
     @staticmethod
     def _create_driver(download_dir: Path) -> "webdriver.Firefox":
@@ -292,19 +321,37 @@ class PDFDownloader:
         except WebDriverException:
             pass
         self.driver.get(self.SCHOLAR_URL)
+        self._handle_challenge(
+            "Google Scholar asked for verification before the search box became available."
+        )
         wait = WebDriverWait(self.driver, 20)
         search_box = wait.until(EC.presence_of_element_located((By.NAME, "q")))
         search_box.clear()
         search_box.send_keys(reference)
         search_box.submit()
+        self._handle_challenge(
+            "Google Scholar requested verification after submitting the query."
+        )
 
     def _get_first_result(self):
-        wait = WebDriverWait(self.driver, 20)
-        return wait.until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "div.gs_r.gs_or.gs_scl")
+        deadline = time.time() + 60
+        last_exception: Optional[Exception] = None
+        while time.time() < deadline:
+            self._handle_challenge(
+                "Google Scholar needs verification before showing the search results."
             )
-        )
+            wait = WebDriverWait(self.driver, 10)
+            try:
+                return wait.until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "div.gs_r.gs_or.gs_scl")
+                    )
+                )
+            except TimeoutException as exc:
+                last_exception = exc
+        if last_exception:
+            raise last_exception
+        raise TimeoutException("No Google Scholar results were found")
 
     @staticmethod
     def _extract_pdf_link(result_block):
@@ -383,6 +430,40 @@ class PDFDownloader:
     @staticmethod
     def _dedupe_destination(path: Path) -> Path:
         return _dedupe_path(path)
+
+    def _handle_challenge(self, context: str) -> None:
+        if not self._is_challenge_page():
+            return
+
+        message = (
+            "Google Scholar is requesting verification (e.g., an 'I'm not a robot' "
+            "challenge). "
+            f"{context}"
+            "\n\nPlease switch to the Firefox window, complete the verification, and then "
+            "return to this application."
+        )
+        if self.challenge_callback is not None:
+            try:
+                self.challenge_callback(message)
+            except Exception:
+                pass
+
+        deadline = time.time() + self.CHALLENGE_TIMEOUT
+        while time.time() < deadline:
+            time.sleep(1)
+            if not self._is_challenge_page():
+                return
+
+        raise TimeoutException("Verification challenge was not cleared in time")
+
+    def _is_challenge_page(self) -> bool:
+        try:
+            source = self.driver.page_source
+            current_url = self.driver.current_url
+        except WebDriverException:
+            return False
+
+        return page_requires_verification(source, current_url)
 
 
 class App(tk.Tk):
@@ -475,7 +556,7 @@ class App(tk.Tk):
         retry_candidates: List[tuple[int, ReferenceTask, DownloadResult]] = []
 
         try:
-            self.downloader = PDFDownloader(temp_dir)
+            self.downloader = PDFDownloader(temp_dir, self._prompt_challenge)
             for task in tasks:
                 self._update_status(
                     f"Processing {task.index}/{len(references)}: {task.preview}"
@@ -561,6 +642,20 @@ class App(tk.Tk):
             messagebox.showinfo("Download summary", "\n".join(summary_lines))
 
         self.after(0, finish_ui)
+
+    def _prompt_challenge(self, message: str) -> None:
+        event = threading.Event()
+
+        def show_message() -> None:
+            self.status_var.set(
+                "Waiting for manual verification in Firefox (complete the challenge and click OK)..."
+            )
+            messagebox.showinfo("Manual verification required", message)
+            event.set()
+
+        self.after(0, show_message)
+        event.wait()
+        self._update_status("Resuming downloads...")
 
 
 if __name__ == "__main__":
