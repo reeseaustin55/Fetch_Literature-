@@ -50,6 +50,8 @@ else:  # pragma: no cover - executed only when PyPDF2 is unavailable
 
 
 REFERENCE_LEAD_PATTERN = re.compile(r"^\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*")
+DOI_PATTERN = re.compile(r"10\.\d{4,9}/[^\s\"<>]+", re.IGNORECASE)
+URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 
 CHALLENGE_KEYWORDS = (
     "i'm not a robot",
@@ -188,6 +190,36 @@ def derive_title(reference: str) -> str:
     return candidate
 
 
+TRAILING_PUNCTUATION = ".,);:]\"'"
+
+
+def _strip_trailing_punctuation(value: str) -> str:
+    return value.rstrip(TRAILING_PUNCTUATION)
+
+
+def build_reference_signature(reference: str, title: str = "") -> Optional[str]:
+    """Generate a normalized token used to detect duplicate references."""
+
+    cleaned = REFERENCE_LEAD_PATTERN.sub("", reference).strip()
+    if not cleaned:
+        return None
+
+    doi_match = DOI_PATTERN.search(cleaned)
+    if doi_match:
+        return f"doi:{_strip_trailing_punctuation(doi_match.group(0)).lower()}"
+
+    url_match = URL_PATTERN.search(cleaned)
+    if url_match:
+        return f"url:{_strip_trailing_punctuation(url_match.group(0)).lower()}"
+
+    normalized_title = re.sub(r"\s+", " ", title).strip().lower()
+    if normalized_title:
+        return f"title:{normalized_title}"
+
+    normalized_reference = re.sub(r"\s+", " ", cleaned).strip().lower()
+    return normalized_reference or None
+
+
 @dataclass
 class DownloadResult:
     target: str
@@ -202,6 +234,7 @@ class ReferenceTask:
     reference: str
     output_name: str
     preview: str
+    duplicate_of: Optional[int] = None
 
 
 @dataclass
@@ -886,12 +919,22 @@ class App(tk.Tk):
         self._manual_prompt_acknowledged = False
         temp_dir = Path(tempfile.mkdtemp(prefix="fetch_pdfs_"))
         tasks: List[ReferenceTask] = []
+        seen_signatures: dict[str, int] = {}
         for index, reference in enumerate(references, start=1):
             title = derive_title(reference)
             sanitized_title = _sanitize_filename(title)[:150] if title else ""
             output_name = sanitized_title if sanitized_title else f"reference_{index:03d}"
             preview = reference if len(reference) <= 80 else reference[:77] + "..."
-            tasks.append(ReferenceTask(index, reference, output_name, preview))
+            signature = build_reference_signature(reference, title)
+            duplicate_of = None
+            if signature:
+                if signature in seen_signatures:
+                    duplicate_of = seen_signatures[signature]
+                else:
+                    seen_signatures[signature] = index
+            tasks.append(
+                ReferenceTask(index, reference, output_name, preview, duplicate_of)
+            )
 
         final_results: List[Optional[DownloadResult]] = [None] * len(tasks)
         retry_successes: List[ReferenceTask] = []
@@ -902,9 +945,47 @@ class App(tk.Tk):
             self.downloader = PDFDownloader(
                 temp_dir, self._prompt_challenge, download_timeout=timeout_seconds
             )
+            total_tasks = len(references)
             for task in tasks:
+                if task.duplicate_of is not None:
+                    self._update_status(
+                        f"Skipping duplicate {task.index}/{total_tasks}: matches entry {task.duplicate_of}"
+                    )
+                    original_result = (
+                        final_results[task.duplicate_of - 1]
+                        if 0 <= task.duplicate_of - 1 < len(final_results)
+                        else None
+                    )
+                    if isinstance(original_result, DownloadResult):
+                        if original_result.success:
+                            message = (
+                                f"Duplicate of entry {task.duplicate_of}; reused downloaded file"
+                            )
+                        else:
+                            reason = (
+                                f"{original_result.message}"
+                                if original_result.message
+                                else "original attempt failed"
+                            )
+                            message = (
+                                f"Duplicate of entry {task.duplicate_of}; original failed: {reason}"
+                            )
+                        final_results[task.index - 1] = DownloadResult(
+                            task.reference,
+                            original_result.success,
+                            message,
+                            original_result.destination,
+                        )
+                    else:
+                        final_results[task.index - 1] = DownloadResult(
+                            task.reference,
+                            False,
+                            f"Duplicate of entry {task.duplicate_of}; original result unavailable",
+                        )
+                    continue
+
                 self._update_status(
-                    f"Processing {task.index}/{len(references)}: {task.preview}"
+                    f"Processing {task.index}/{total_tasks}: {task.preview}"
                 )
                 result = self.downloader.download(
                     task.reference,
@@ -922,6 +1003,8 @@ class App(tk.Tk):
                     f"Retrying {len(retry_candidates)} reference(s) that failed initially..."
                 )
                 for slot, task, first_result in retry_candidates:
+                    if task.duplicate_of is not None:
+                        continue
                     self._update_status(
                         f"Retrying {task.index}/{len(references)}: {task.preview}"
                     )
@@ -972,7 +1055,13 @@ class App(tk.Tk):
             results = [DownloadResult("Initialization", False, "Downloader did not start")]  # pragma: no cover
 
         success = sum(1 for r in results if r.success)
-        failures = [r for r in results if not r.success]
+        unique_failures: List[DownloadResult] = []
+        for task, result in zip(tasks, results):
+            if result.success:
+                continue
+            if task.duplicate_of is not None:
+                continue
+            unique_failures.append(result)
         success_paths = [
             r.destination
             for r in results
@@ -988,11 +1077,11 @@ class App(tk.Tk):
             summary_lines.append(
                 f"{len(manual_successes)} reference(s) were completed via manual fallback."
             )
-        for fail in failures:
+        for fail in unique_failures:
             summary_lines.append(f"- {fail.target}: {fail.message}")
 
         combined_path, combine_message = stitch_pdfs(success_paths, destination)
-        report_path = create_failure_report(destination, failures)
+        report_path = create_failure_report(destination, unique_failures)
 
         notes: List[str] = []
         if combined_path:
@@ -1018,8 +1107,11 @@ class App(tk.Tk):
     ) -> List[ReferenceTask]:
         pending: List[tuple[int, ReferenceTask, DownloadResult]] = []
         for idx, result in enumerate(final_results):
+            task = tasks[idx]
+            if task.duplicate_of is not None:
+                continue
             if isinstance(result, DownloadResult) and not result.success:
-                pending.append((idx, tasks[idx], result))
+                pending.append((idx, task, result))
 
         if not pending:
             return []
