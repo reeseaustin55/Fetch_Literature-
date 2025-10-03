@@ -35,7 +35,6 @@ if selenium_spec is not None:
     )
     from selenium.webdriver.common.by import By
     from selenium.webdriver.firefox.options import Options as FirefoxOptions
-    from selenium.webdriver.chrome.options import Options as ChromeOptions
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
 else:  # pragma: no cover - executed only when selenium is unavailable
@@ -45,9 +44,10 @@ else:  # pragma: no cover - executed only when selenium is unavailable
 
 pypdf2_spec = importlib.util.find_spec("PyPDF2")
 if pypdf2_spec is not None:
-    from PyPDF2 import PdfMerger  # type: ignore
+    from PyPDF2 import PdfMerger, PdfReader  # type: ignore
 else:  # pragma: no cover - executed only when PyPDF2 is unavailable
     PdfMerger = None  # type: ignore
+    PdfReader = None  # type: ignore
 
 
 REFERENCE_LEAD_PATTERN = re.compile(r"^\s*(?:\[\d+\]|\(\d+\)|\d+[.)])\s*")
@@ -96,6 +96,7 @@ HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 
 
 PDF_MERGER_AVAILABLE = PdfMerger is not None
+PDF_TEXT_EXTRACTION_AVAILABLE = PdfReader is not None
 
 
 def page_requires_verification(page_source: str, current_url: str = "") -> bool:
@@ -432,6 +433,47 @@ def stitch_pdfs(
     return merged_path, None
 
 
+def export_pdf_texts(
+    pdf_entries: List[Tuple[Path, str]], destination_dir: Path
+) -> Tuple[Optional[Path], Optional[str]]:
+    """Create a text file that concatenates text from supplied PDFs."""
+
+    valid_entries = [
+        (path, name)
+        for path, name in pdf_entries
+        if path.exists()
+    ]
+    if not valid_entries:
+        return None, None
+
+    if not PDF_TEXT_EXTRACTION_AVAILABLE:
+        return None, "Install PyPDF2 to export combined PDF text."
+
+    try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return None, f"Failed to prepare destination for combined text ({exc})"
+
+    text_path = _dedupe_path(destination_dir / "combined_references.txt")
+
+    lines: List[str] = []
+    for path, name in valid_entries:
+        lines.append(f"START OF NEXT STUDY: {name}")
+        try:
+            reader = PdfReader(str(path))  # type: ignore[call-arg]
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                if page_text:
+                    lines.append(page_text)
+        except Exception as exc:
+            lines.append(f"[Text extraction failed for {path.name}: {exc}]")
+        lines.append("")
+
+    text_content = "\n".join(lines).strip() + "\n"
+    text_path.write_text(text_content, encoding="utf-8")
+    return text_path, None
+
+
 def get_default_download_dir() -> Path:
     """Best-effort guess of the user's default download directory."""
 
@@ -575,50 +617,32 @@ class PDFDownloader:
         download_dir: Path,
         challenge_callback: Optional[Callable[[str], None]] = None,
         download_timeout: float = 30.0,
-        browser_choice: str = "firefox",
     ) -> None:
         if webdriver is None:
             raise RuntimeError(
                 "Selenium is not available. Please install it via 'pip install selenium' "
-                "and ensure a supported browser driver (geckodriver for Firefox or "
-                "chromedriver for Chrome) is installed."
+                "and ensure geckodriver for Firefox is installed."
             )
         self.download_dir = download_dir
-        self.browser_choice = browser_choice.lower() if browser_choice else "firefox"
-        if self.browser_choice not in {"firefox", "chrome"}:
-            self.browser_choice = "firefox"
-        self.browser_label = "Chrome" if self.browser_choice == "chrome" else "Firefox"
-        self.driver = self._create_driver(download_dir, self.browser_choice)
+        self.browser_label = "Firefox"
+        self.driver = self._create_driver(download_dir)
         self.base_handle = self.driver.current_window_handle
         self.challenge_callback = challenge_callback
         self.download_timeout = max(1.0, float(download_timeout))
 
     @staticmethod
-    def _create_driver(download_dir: Path, browser_choice: str) -> "webdriver.Remote":
-        if browser_choice == "chrome":
-            options = ChromeOptions()
-            prefs = {
-                "download.default_directory": str(download_dir),
-                "download.prompt_for_download": False,
-                "download.directory_upgrade": True,
-                "plugins.always_open_pdf_externally": True,
-            }
-            options.add_experimental_option("prefs", prefs)
-            options.add_argument("--start-maximized")
+    def _create_driver(download_dir: Path) -> "webdriver.Remote":
+        options = FirefoxOptions()
+        options.set_preference("browser.download.folderList", 2)
+        options.set_preference("browser.download.dir", str(download_dir))
+        options.set_preference(
+            "browser.helperApps.neverAsk.saveToDisk", "application/pdf"
+        )
+        options.set_preference("pdfjs.disabled", True)
+        options.set_preference("browser.download.manager.showWhenStarting", False)
+        options.set_preference("browser.download.useDownloadDir", True)
 
-            driver = webdriver.Chrome(options=options)
-        else:
-            options = FirefoxOptions()
-            options.set_preference("browser.download.folderList", 2)
-            options.set_preference("browser.download.dir", str(download_dir))
-            options.set_preference(
-                "browser.helperApps.neverAsk.saveToDisk", "application/pdf"
-            )
-            options.set_preference("pdfjs.disabled", True)
-            options.set_preference("browser.download.manager.showWhenStarting", False)
-            options.set_preference("browser.download.useDownloadDir", True)
-
-            driver = webdriver.Firefox(options=options)
+        driver = webdriver.Firefox(options=options)
 
         driver.maximize_window()
         return driver
@@ -977,7 +1001,6 @@ class App(tk.Tk):
         self.download_thread: Optional[threading.Thread] = None
         self.downloader: Optional[PDFDownloader] = None
         self._skip_event = threading.Event()
-        self.browser_var = tk.StringVar(value="Firefox")
         self.manual_retry_var = tk.BooleanVar(value=True)
         self.manual_auto_var = tk.BooleanVar(value=True)
         self._manual_prompt_acknowledged = False
@@ -1015,11 +1038,10 @@ class App(tk.Tk):
         self.timeout_entry = tk.Entry(path_frame, textvariable=self.timeout_var, width=10)
         self.timeout_entry.grid(row=1, column=1, sticky="w", padx=5, pady=(0, 5))
 
-        tk.Label(path_frame, text="Automated browser:").grid(
-            row=2, column=0, sticky="w"
-        )
-        browser_menu = tk.OptionMenu(path_frame, self.browser_var, "Firefox", "Chrome")
-        browser_menu.grid(row=2, column=1, sticky="w", padx=5, pady=(0, 5))
+        tk.Label(
+            path_frame,
+            text="Automated browser: Firefox (requires geckodriver)",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 5))
 
         manual_check = tk.Checkbutton(
             path_frame,
@@ -1097,10 +1119,7 @@ class App(tk.Tk):
             )
             return
 
-        browser_choice = self.browser_var.get().strip().lower()
-        if browser_choice not in {"firefox", "chrome"}:
-            browser_choice = "firefox"
-        self._current_browser_label = "Chrome" if browser_choice == "chrome" else "Firefox"
+        self._current_browser_label = "Firefox"
 
         self.status_var.set("Starting downloads...")
         self.download_button.config(state=tk.DISABLED)
@@ -1108,7 +1127,7 @@ class App(tk.Tk):
         self._skip_event.clear()
         self.download_thread = threading.Thread(
             target=self._run_downloads,
-            args=(references, destination, timeout_seconds, browser_choice),
+            args=(references, destination, timeout_seconds),
             daemon=True,
         )
         self.download_thread.start()
@@ -1118,7 +1137,6 @@ class App(tk.Tk):
         references: List[str],
         destination: Path,
         timeout_seconds: float,
-        browser_choice: str,
     ) -> None:
         self._manual_prompt_acknowledged = False
         temp_dir = Path(tempfile.mkdtemp(prefix="fetch_pdfs_"))
@@ -1150,7 +1168,6 @@ class App(tk.Tk):
                 temp_dir,
                 self._prompt_challenge,
                 download_timeout=timeout_seconds,
-                browser_choice=browser_choice,
             )
             total_tasks = len(references)
             for task in tasks:
@@ -1234,7 +1251,7 @@ class App(tk.Tk):
                         final_results[slot] = retry_result
 
             if self.manual_retry_var.get():
-                manual_timeout = 20.0
+                manual_timeout = 60.0
                 manual_successes = self._run_manual_fallback(
                     tasks,
                     final_results,
@@ -1270,11 +1287,16 @@ class App(tk.Tk):
             if task.duplicate_of is not None:
                 continue
             unique_failures.append(result)
-        success_paths = [
-            r.destination
-            for r in results
-            if r.success and r.destination is not None and r.destination.exists()
-        ]
+        success_entries = []
+        for r in results:
+            if not r.success or r.destination is None:
+                continue
+            if not r.destination.exists():
+                continue
+            label = r.used_filename or r.destination.stem
+            success_entries.append((r.destination, label))
+
+        success_paths = [path for path, _ in success_entries]
 
         summary_lines = [f"Downloaded {success} of {len(references)} references."]
         if retry_successes:
@@ -1289,6 +1311,10 @@ class App(tk.Tk):
             summary_lines.append(f"- {fail.target}: {fail.message}")
 
         combined_path, combine_message = stitch_pdfs(success_paths, destination)
+        text_path: Optional[Path] = None
+        text_message: Optional[str] = None
+        if success_entries:
+            text_path, text_message = export_pdf_texts(success_entries, destination)
         report_path = create_failure_report(destination, unique_failures)
 
         notes: List[str] = []
@@ -1296,6 +1322,11 @@ class App(tk.Tk):
             notes.append(f"Combined PDF saved to: {combined_path}")
         elif combine_message:
             notes.append(combine_message)
+
+        if text_path:
+            notes.append(f"Combined text export saved to: {text_path}")
+        elif text_message:
+            notes.append(text_message)
 
         if report_path:
             notes.append(f"A list of missed PDFs was saved to: {report_path}")

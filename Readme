@@ -5,9 +5,8 @@ This repository provides a small Tkinter + Selenium utility that can automate do
 ## Requirements
 
 - Python 3.9+
-- Firefox or Chrome browser (whichever you plan to automate)
-- Matching WebDriver binary on your system `PATH` (`geckodriver` for Firefox or
-  `chromedriver` for Chrome)
+- Firefox browser
+- Matching WebDriver binary on your system `PATH` (`geckodriver` for Firefox)
 - Python dependencies: `selenium`, `PyPDF2`
 
 Install dependencies with:
@@ -25,8 +24,8 @@ pip install selenium PyPDF2
    ```
 
 2. Paste bibliography entries into the text box. Entries can be separated by blank lines **or** by numbering such as `[1]`, `(2)`, or `3.`—the parser will split them accordingly. Duplicate references (identified by DOI, URL, or title) are skipped automatically so the downloader only fetches each study once.
-3. Choose the destination folder for the downloaded PDFs (defaults to a folder on your Desktop), select whether Selenium should control Firefox or Chrome, and, if desired, adjust the per-reference download timeout (10 seconds by default). The **Offer manual browser fallback for missed PDFs** option is enabled by default so stubborn downloads automatically fall back to your own browser, but you can clear the checkbox if you prefer a fully automated run.
-4. Click **Download PDFs**. The application will launch the selected browser, search each reference on Google Scholar, follow the first result, download the associated PDF, and save it into the chosen folder. Each file is named after the title reported by the Google Scholar result or article page itself (falling back to a numeric sequence otherwise). Use the **Skip ▶** control if you need to manually advance to the next reference without waiting for the active attempt to finish. Every Google Scholar lookup now submits the entire reference text (after stripping numbering) alongside the article metadata, which keeps abbreviated citations anchored to the correct paper instead of drifting to author profile pages.
+3. Choose the destination folder for the downloaded PDFs (defaults to a folder on your Desktop) and, if desired, adjust the per-reference download timeout (10 seconds by default). The **Offer manual browser fallback for missed PDFs** option is enabled by default so stubborn downloads automatically fall back to your own browser, but you can clear the checkbox if you prefer a fully automated run.
+4. Click **Download PDFs**. The application will launch Firefox, search each reference on Google Scholar, follow the first result, download the associated PDF, and save it into the chosen folder. Each file is named after the title reported by the Google Scholar result or article page itself (falling back to a numeric sequence otherwise). Use the **Skip ▶** control if you need to manually advance to the next reference without waiting for the active attempt to finish. Every Google Scholar lookup now submits the entire reference text (after stripping numbering) alongside the article metadata, which keeps abbreviated citations anchored to the correct paper instead of drifting to author profile pages.
    - If Google Scholar interrupts with a verification step (for example an “I'm not a robot” challenge), the app pauses and shows a dialog. Complete the verification manually in the browser that opened and press **OK** to continue.
 5. When finished, a summary dialog displays the results. Any references that fail
    on the first pass are automatically retried once more before the summary is
@@ -39,9 +38,9 @@ pip install selenium PyPDF2
 
    - If the manual fallback option is enabled, the app opens the remaining
      references in your default browser and watches your **Downloads** folder
-     for a new PDF for up to 20 seconds per reference. As soon as a file appears
-    there, it is moved into the chosen destination and renamed to match the
-    title reported by Google Scholar for that result. The confirmation instructions only appear the first time
+     for a new PDF for up to 60 seconds per reference. As soon as a file appears
+     there, it is moved into the chosen destination and renamed to match the
+     title reported by Google Scholar for that result. The confirmation instructions only appear the first time
      manual fallback runs during a session.
    - With the **Try to auto-open the first PDF when manual fallback runs**
      checkbox (enabled by default), the tool fetches the first Google Scholar
@@ -50,4 +49,9 @@ pip install selenium PyPDF2
      showing the standard Google Scholar results page so you can complete the
      download yourself.
 
-Downloads occur through whichever browser you select so they retain any session-based access you have in that profile (provided the matching WebDriver reuses it).
+   - When `PyPDF2` is installed, the downloader also saves a `combined_references.pdf`
+     and a companion `combined_references.txt` in the destination folder. The text
+     file concatenates the extracted text from each study and labels every section
+     with `START OF NEXT STUDY:` followed by the detected study title.
+
+Downloads occur through Firefox so they retain any session-based access you have in that profile (provided the matching WebDriver reuses it).
