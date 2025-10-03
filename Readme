@@ -7,12 +7,12 @@ This repository provides a small Tkinter + Selenium utility that can automate do
 - Python 3.9+
 - Firefox browser (since Chrome is not available)
 - `geckodriver` available on your system `PATH`
-- Python dependencies: `selenium`
+- Python dependencies: `selenium`, `PyPDF2`
 
 Install dependencies with:
 
 ```bash
-pip install selenium
+pip install selenium PyPDF2
 ```
 
 ## Usage
@@ -31,7 +31,9 @@ pip install selenium
    on the first pass are automatically retried once more before the summary is
    shown. If any PDFs still cannot be downloaded, a `missing_pdfs.txt` report is
    written to the destination folder listing the references and the reason they
-   were skipped.
+   were skipped. Successful downloads are also stitched together into a
+   `combined_references.pdf` file in the destination folder when `PyPDF2` is
+   available.
 
    - If the manual fallback option is enabled, the app opens the remaining
      references in your default browser and watches your **Downloads** folder

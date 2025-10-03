@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional, Tuple
 
 import re
 import unicodedata
@@ -40,6 +40,13 @@ else:  # pragma: no cover - executed only when selenium is unavailable
     TimeoutException = WebDriverException = Exception  # type: ignore
 
 
+pypdf2_spec = importlib.util.find_spec("PyPDF2")
+if pypdf2_spec is not None:
+    from PyPDF2 import PdfMerger  # type: ignore
+else:  # pragma: no cover - executed only when PyPDF2 is unavailable
+    PdfMerger = None  # type: ignore
+
+
 REFERENCE_LEAD_PATTERN = re.compile(r"^\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*")
 
 CHALLENGE_KEYWORDS = (
@@ -50,6 +57,9 @@ CHALLENGE_KEYWORDS = (
     "press and hold",
     "complete the captcha",
 )
+
+
+PDF_MERGER_AVAILABLE = PdfMerger is not None
 
 
 def page_requires_verification(page_source: str, current_url: str = "") -> bool:
@@ -201,6 +211,54 @@ def _dedupe_path(path: Path) -> Path:
         final_path = path.with_name(f"{path.stem}_{counter}{path.suffix}")
         counter += 1
     return final_path
+
+
+def stitch_pdfs(
+    pdf_files: List[Path], destination_dir: Path
+) -> Tuple[Optional[Path], Optional[str]]:
+    """Combine multiple PDF files into a single document.
+
+    Returns a tuple of the merged file path (if created) and a message describing
+    why the merge was skipped or failed. When no PDFs are supplied the function
+    returns ``(None, None)``.
+    """
+
+    valid_files = [path for path in pdf_files if path.exists()]
+    if not valid_files:
+        return None, None
+
+    if not PDF_MERGER_AVAILABLE:
+        return None, "Install PyPDF2 to enable combined PDF output."
+
+    try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return None, f"Failed to prepare destination for combined PDF ({exc})"
+    merged_path = _dedupe_path(destination_dir / "combined_references.pdf")
+
+    merger = PdfMerger()  # type: ignore[call-arg]
+    try:
+        for pdf_path in valid_files:
+            merger.append(str(pdf_path))
+        with merged_path.open("wb") as handle:
+            merger.write(handle)
+    except Exception as exc:  # pragma: no cover - best effort cleanup
+        try:
+            merger.close()
+        finally:
+            if merged_path.exists():
+                try:
+                    merged_path.unlink()
+                except OSError:
+                    pass
+        return None, f"Failed to create combined PDF ({exc})"
+
+    try:
+        merger.close()
+    except Exception:  # pragma: no cover - merger cleanup failures
+        pass
+
+    return merged_path, None
 
 
 def get_default_download_dir() -> Path:
@@ -808,6 +866,11 @@ class App(tk.Tk):
 
         success = sum(1 for r in results if r.success)
         failures = [r for r in results if not r.success]
+        success_paths = [
+            r.destination
+            for r in results
+            if r.success and r.destination is not None and r.destination.exists()
+        ]
 
         summary_lines = [f"Downloaded {success} of {len(references)} references."]
         if retry_successes:
@@ -821,12 +884,21 @@ class App(tk.Tk):
         for fail in failures:
             summary_lines.append(f"- {fail.target}: {fail.message}")
 
+        combined_path, combine_message = stitch_pdfs(success_paths, destination)
         report_path = create_failure_report(destination, failures)
+
+        notes: List[str] = []
+        if combined_path:
+            notes.append(f"Combined PDF saved to: {combined_path}")
+        elif combine_message:
+            notes.append(combine_message)
+
         if report_path:
+            notes.append(f"A list of missed PDFs was saved to: {report_path}")
+
+        if notes:
             summary_lines.append("")
-            summary_lines.append(
-                f"A list of missed PDFs was saved to: {report_path}"
-            )
+            summary_lines.extend(notes)
 
         self._finish(summary_lines)
 
