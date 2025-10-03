@@ -55,6 +55,10 @@ LOOSE_REFERENCE_LEAD_PATTERN = re.compile(
 )
 DOI_PATTERN = re.compile(r"10\.\d{4,9}/[^\s\"<>]+", re.IGNORECASE)
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+PAGES_PATTERN = re.compile(r"\b(\d{1,4}\s*[–-]\s*\d{1,4})\b")
+JOURNAL_BEFORE_YEAR_PATTERN = re.compile(
+    r"[,;]\s*([^,;]+?)(?=[,;]\s*(?:19|20)\d{2}\b)"
+)
 
 CHALLENGE_KEYWORDS = (
     "i'm not a robot",
@@ -204,6 +208,84 @@ def derive_title(reference: str) -> str:
         candidate = candidate.strip(" .;:,-")
 
     return candidate
+
+
+def _extract_first_author(reference: str) -> str:
+    cleaned = _strip_reference_lead(reference)
+    if not cleaned:
+        return ""
+
+    first_segment = cleaned.split(",", 1)[0].strip()
+    if not first_segment:
+        return ""
+
+    match = re.search(r"([A-Z][A-Za-zÀ-ÖØ-öø-ÿ'`-]+)$", first_segment)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _extract_journal(reference: str) -> str:
+    cleaned = _strip_reference_lead(reference)
+    if not cleaned:
+        return ""
+
+    cleaned = DOI_PATTERN.sub("", cleaned)
+    cleaned = URL_PATTERN.sub("", cleaned)
+
+    match = JOURNAL_BEFORE_YEAR_PATTERN.search(cleaned)
+    if match:
+        journal = match.group(1).strip(" .,;:()")
+        return journal
+    return ""
+
+
+def build_search_query(reference: str) -> str:
+    cleaned = _strip_reference_lead(reference)
+    if not cleaned:
+        return reference
+
+    doi_match = DOI_PATTERN.search(cleaned)
+    if doi_match:
+        return _strip_trailing_punctuation(doi_match.group(0))
+
+    url_match = URL_PATTERN.search(cleaned)
+    if url_match:
+        return _strip_trailing_punctuation(url_match.group(0))
+
+    components: List[str] = []
+
+    title = derive_title(reference).strip()
+    title_is_valid = (
+        bool(title)
+        and len(title) >= 8
+        and "," not in title
+        and not re.match(r"^[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'`-]+,?\s*[A-Z]?\.?$", title)
+    )
+    if title_is_valid:
+        components.append(f'"{title}"')
+
+    journal = _extract_journal(reference)
+    if journal and (not title_is_valid or journal.lower() not in title.lower()):
+        components.append(f'"{journal}"')
+
+    year_match = YEAR_PATTERN.search(cleaned)
+    if year_match:
+        components.append(year_match.group(0))
+
+    pages_match = PAGES_PATTERN.search(cleaned)
+    if pages_match:
+        page_token = pages_match.group(1).replace(" ", "")
+        components.append(f'"{page_token}"')
+
+    author_last_name = _extract_first_author(reference)
+    if author_last_name:
+        components.append(author_last_name)
+
+    if not components:
+        return cleaned
+
+    return " ".join(dict.fromkeys(components))
 
 
 TRAILING_PUNCTUATION = ".,);:]\"'"
@@ -428,8 +510,11 @@ def _parse_manual_targets(html: str, base: str) -> Tuple[Optional[str], Optional
 
 
 def resolve_manual_targets(reference: str, timeout: float = 10.0) -> ManualTargets:
+    query = build_search_query(reference)
+    if not query.strip():
+        query = reference
     query_url = (
-        f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q={quote_plus(reference)}"
+        f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q={quote_plus(query)}"
     )
 
     try:
@@ -606,6 +691,10 @@ class PDFDownloader:
     def _search_reference(
         self, reference: str, skip_event: Optional[threading.Event] = None
     ) -> None:
+        query = build_search_query(reference)
+        if not query.strip():
+            query = reference
+
         try:
             self.driver.switch_to.window(self.base_handle)
         except WebDriverException:
@@ -623,7 +712,7 @@ class PDFDownloader:
         wait = WebDriverWait(self.driver, 20)
         search_box = wait.until(locate_box)
         search_box.clear()
-        search_box.send_keys(reference)
+        search_box.send_keys(query)
         search_box.submit()
         self._handle_challenge(
             "Google Scholar requested verification after submitting the query.",
