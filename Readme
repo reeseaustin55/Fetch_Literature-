@@ -41,5 +41,11 @@ pip install selenium PyPDF2
      there, it is moved into the chosen destination and renamed to match the
      reference title. The confirmation instructions only appear the first time
      manual fallback runs during a session.
+   - With the **Try to auto-open the first PDF when manual fallback runs**
+     checkbox (enabled by default), the tool fetches the first Google Scholar
+     result in the background and attempts to open the associated PDF or article
+     link for you. If that automated lookup fails, it falls back to showing the
+     standard Google Scholar results page so you can complete the download
+     yourself.
 
 Downloads occur through Firefox so they retain any session-based access you have in your browser profile.

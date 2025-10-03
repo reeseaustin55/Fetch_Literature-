@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from html import unescape
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Tuple
 
@@ -21,6 +22,7 @@ from tkinter import filedialog, messagebox, scrolledtext
 
 import importlib.util
 from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
 
 
 selenium_spec = importlib.util.find_spec("selenium")
@@ -56,6 +58,24 @@ CHALLENGE_KEYWORDS = (
     "recaptcha",
     "press and hold",
     "complete the captcha",
+)
+
+
+SCHOLAR_BASE_URL = "https://scholar.google.com"
+
+SCHOLAR_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/118.0 Safari/537.36"
+)
+
+SCHOLAR_PDF_LINK_PATTERN = re.compile(
+    r"<div class=\"gs_or_ggsm\".*?<a href=\"([^\"]+)\"",
+    re.IGNORECASE | re.DOTALL,
+)
+
+SCHOLAR_ARTICLE_LINK_PATTERN = re.compile(
+    r"<h3 class=\"gs_rt\".*?<a href=\"([^\"]+)\"",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -182,6 +202,13 @@ class ReferenceTask:
     reference: str
     output_name: str
     preview: str
+
+
+@dataclass
+class ManualTargets:
+    query_url: str
+    article_url: Optional[str]
+    pdf_url: Optional[str]
 
 
 def create_failure_report(destination: Path, failures: List["DownloadResult"]) -> Optional[Path]:
@@ -321,6 +348,52 @@ def _merge_failure_messages(initial: str, retry: str) -> str:
     if retry:
         parts.append(f"retry attempt: {retry}")
     return "; ".join(parts) if parts else ""
+
+
+def _make_absolute_url(url: str, base: str) -> str:
+    if not url:
+        return url
+    lowered = url.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        return url
+    if lowered.startswith("//"):
+        return f"https:{url}" if not lowered.startswith("https://") else url
+    if url.startswith("/"):
+        return base.rstrip("/") + url
+    return url
+
+
+def _parse_manual_targets(html: str, base: str) -> Tuple[Optional[str], Optional[str]]:
+    pdf_url: Optional[str] = None
+    article_url: Optional[str] = None
+
+    pdf_match = SCHOLAR_PDF_LINK_PATTERN.search(html)
+    if pdf_match:
+        pdf_url = _make_absolute_url(unescape(pdf_match.group(1).strip()), base)
+
+    article_match = SCHOLAR_ARTICLE_LINK_PATTERN.search(html)
+    if article_match:
+        article_url = _make_absolute_url(unescape(article_match.group(1).strip()), base)
+
+    return pdf_url, article_url
+
+
+def resolve_manual_targets(reference: str, timeout: float = 10.0) -> ManualTargets:
+    query_url = f"{SCHOLAR_BASE_URL}/scholar?q={quote_plus(reference)}"
+
+    try:
+        request = Request(query_url, headers={"User-Agent": SCHOLAR_USER_AGENT})
+        with urlopen(request, timeout=timeout) as response:
+            html_bytes = response.read()
+    except Exception:
+        return ManualTargets(query_url, None, None)
+
+    html_text = html_bytes.decode("utf-8", errors="ignore")
+    if page_requires_verification(html_text, query_url):
+        return ManualTargets(query_url, None, None)
+
+    pdf_url, article_url = _parse_manual_targets(html_text, SCHOLAR_BASE_URL)
+    return ManualTargets(query_url, article_url, pdf_url)
 
 
 class SkipRequested(Exception):
@@ -659,6 +732,7 @@ class App(tk.Tk):
         self.downloader: Optional[PDFDownloader] = None
         self._skip_event = threading.Event()
         self.manual_retry_var = tk.BooleanVar(value=True)
+        self.manual_auto_var = tk.BooleanVar(value=True)
         self._manual_prompt_acknowledged = False
         self._build_ui()
 
@@ -699,6 +773,13 @@ class App(tk.Tk):
             variable=self.manual_retry_var,
         )
         manual_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 5))
+
+        auto_manual_check = tk.Checkbutton(
+            path_frame,
+            text="Try to auto-open the first PDF when manual fallback runs",
+            variable=self.manual_auto_var,
+        )
+        auto_manual_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 5))
 
         controls_frame = tk.Frame(self)
         controls_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(5, 10))
@@ -980,16 +1061,47 @@ class App(tk.Tk):
                 ),
             )
 
-        query_url = f"{PDFDownloader.SCHOLAR_URL}scholar?q={quote_plus(task.reference)}"
-        try:
-            webbrowser.open_new_tab(query_url)
-        except Exception as exc:  # pragma: no cover - OS/browser specific
-            return DownloadResult(
-                task.reference,
-                False,
-                self._append_manual_note(
-                    previous_message, f"Could not open browser ({exc})"
-                ),
+        targets = resolve_manual_targets(task.reference)
+        auto_notes: List[str] = []
+        opened = False
+
+        if self.manual_auto_var.get():
+            if targets.pdf_url:
+                self._update_status(
+                    "Opening detected PDF link in default browser..."
+                )
+                try:
+                    webbrowser.open_new_tab(targets.pdf_url)
+                    opened = True
+                    auto_notes.append("Opened PDF link automatically")
+                except Exception as exc:  # pragma: no cover - OS/browser specific
+                    auto_notes.append(f"Automatic PDF open failed ({exc})")
+            elif targets.article_url:
+                self._update_status(
+                    "Opening detected article link in default browser..."
+                )
+                try:
+                    webbrowser.open_new_tab(targets.article_url)
+                    opened = True
+                    auto_notes.append("Opened article link automatically")
+                except Exception as exc:  # pragma: no cover - OS/browser specific
+                    auto_notes.append(f"Automatic article open failed ({exc})")
+
+        if not opened:
+            try:
+                webbrowser.open_new_tab(targets.query_url)
+            except Exception as exc:  # pragma: no cover - OS/browser specific
+                return DownloadResult(
+                    task.reference,
+                    False,
+                    self._append_manual_note(
+                        previous_message, f"Could not open browser ({exc})"
+                    ),
+                )
+
+        if auto_notes:
+            previous_message = self._append_manual_note(
+                previous_message, "; ".join(auto_notes)
             )
 
         existing_files = {p.resolve() for p in downloads_dir.glob("*.pdf")}
