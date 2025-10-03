@@ -24,7 +24,7 @@ pip install selenium
    ```
 
 2. Paste bibliography entries into the text box. Entries can be separated by blank lines **or** by numbering such as `[1]`, `(2)`, or `3.`—the parser will split them accordingly.
-3. Choose the destination folder for the downloaded PDFs (defaults to a folder on your Desktop) and, if desired, adjust the per-reference download timeout (30 seconds by default). Enable **Offer manual browser fallback for missed PDFs** if you would like the app to prompt you to finish any stubborn downloads yourself.
+3. Choose the destination folder for the downloaded PDFs (defaults to a folder on your Desktop) and, if desired, adjust the per-reference download timeout (30 seconds by default). Enable **Offer manual browser fallback for missed PDFs** if you would like the app to prompt you once with instructions for finishing any stubborn downloads yourself.
 4. Click **Download PDFs**. The application will launch Firefox, search each reference on Google Scholar, follow the first result, download the associated PDF, and save it into the chosen folder. Each file is named after the detected study title when possible (falling back to a numeric sequence otherwise). Use the **Skip ▶** control if you need to manually advance to the next reference without waiting for the active attempt to finish.
    - If Google Scholar interrupts with a verification step (for example an “I'm not a robot” challenge), the app pauses and shows a dialog. Complete the verification manually in Firefox and press **OK** to continue.
 5. When finished, a summary dialog displays the results. Any references that fail
@@ -35,7 +35,9 @@ pip install selenium
 
    - If the manual fallback option is enabled, the app opens the remaining
      references in your default browser and watches your **Downloads** folder
-     for a new PDF. As soon as a file appears there, it is moved into the chosen
-     destination and renamed to match the reference title.
+     for a new PDF for up to 20 seconds per reference. As soon as a file appears
+     there, it is moved into the chosen destination and renamed to match the
+     reference title. The confirmation instructions only appear the first time
+     manual fallback runs during a session.
 
 Downloads occur through Firefox so they retain any session-based access you have in your browser profile.

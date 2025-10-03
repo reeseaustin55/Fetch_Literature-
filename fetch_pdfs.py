@@ -601,6 +601,7 @@ class App(tk.Tk):
         self.downloader: Optional[PDFDownloader] = None
         self._skip_event = threading.Event()
         self.manual_retry_var = tk.BooleanVar(value=False)
+        self._manual_prompt_acknowledged = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -717,6 +718,7 @@ class App(tk.Tk):
     def _run_downloads(
         self, references: List[str], destination: Path, timeout_seconds: float
     ) -> None:
+        self._manual_prompt_acknowledged = False
         temp_dir = Path(tempfile.mkdtemp(prefix="fetch_pdfs_"))
         tasks: List[ReferenceTask] = []
         for index, reference in enumerate(references, start=1):
@@ -776,11 +778,12 @@ class App(tk.Tk):
                         final_results[slot] = retry_result
 
             if self.manual_retry_var.get():
+                manual_timeout = 20.0
                 manual_successes = self._run_manual_fallback(
                     tasks,
                     final_results,
                     destination,
-                    timeout_seconds,
+                    manual_timeout,
                 )
         except Exception as exc:  # pragma: no cover - GUI feedback only
             error_message = str(exc)
@@ -887,7 +890,15 @@ class App(tk.Tk):
         timeout_seconds: float,
         previous_message: str,
     ) -> DownloadResult:
-        proceed = self._prompt_manual_confirmation(task, downloads_dir, timeout_seconds)
+        proceed: bool
+        if self._manual_prompt_acknowledged:
+            proceed = True
+        else:
+            proceed = self._prompt_manual_confirmation(
+                task, downloads_dir, timeout_seconds
+            )
+            if proceed:
+                self._manual_prompt_acknowledged = True
         if not proceed:
             return DownloadResult(
                 task.reference,
