@@ -1,0 +1,1024 @@
+#!/usr/bin/env python3
+"""GUI tool to download PDFs for bibliography entries via Selenium-controlled Firefox."""
+
+from __future__ import annotations
+
+import shutil
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterable, List, Optional
+
+import re
+import unicodedata
+import sys
+import webbrowser
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
+
+import importlib.util
+from urllib.parse import quote_plus
+
+
+selenium_spec = importlib.util.find_spec("selenium")
+if selenium_spec is not None:
+    from selenium import webdriver
+    from selenium.common.exceptions import (
+        NoSuchElementException,
+        TimeoutException,
+        WebDriverException,
+    )
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.firefox.options import Options as FirefoxOptions
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+else:  # pragma: no cover - executed only when selenium is unavailable
+    webdriver = None  # type: ignore
+    TimeoutException = WebDriverException = Exception  # type: ignore
+
+
+REFERENCE_LEAD_PATTERN = re.compile(r"^\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*")
+
+CHALLENGE_KEYWORDS = (
+    "i'm not a robot",
+    "not a robot",
+    "unusual traffic",
+    "recaptcha",
+    "press and hold",
+    "complete the captcha",
+)
+
+
+def page_requires_verification(page_source: str, current_url: str = "") -> bool:
+    """Best-effort detection for verification/captcha interruptions."""
+
+    source_lower = page_source.lower()
+    if any(keyword in source_lower for keyword in CHALLENGE_KEYWORDS):
+        return True
+
+    url_lower = current_url.lower()
+    if "sorry/index" in url_lower and "scholar.google" in url_lower:
+        return True
+
+    return False
+
+
+def extract_references(text: str) -> List[str]:
+    """Split raw bibliography text into distinct references.
+
+    The parser groups contiguous non-empty lines, but also treats new numbering tokens
+    (e.g. "[12]", "(3)", or "4.") as the start of a fresh reference even when
+    references are provided without blank lines between them. Leading numbering
+    markers are stripped from the resulting reference text to improve search
+    results.
+    """
+
+    references: List[str] = []
+    current: List[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                references.append(" ".join(current))
+                current = []
+            continue
+
+        if REFERENCE_LEAD_PATTERN.match(stripped):
+            if current:
+                references.append(" ".join(current))
+                current = []
+            stripped = REFERENCE_LEAD_PATTERN.sub("", stripped, count=1).strip()
+
+        current.append(stripped)
+
+    if current:
+        references.append(" ".join(current))
+
+    return references
+
+
+INVALID_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_filename(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", name)
+    without_marks = "".join(
+        ch for ch in normalized if not unicodedata.combining(ch)
+    ).strip()
+    sanitized = INVALID_FILENAME_CHARS.sub("_", without_marks)
+    sanitized = re.sub(r"_+", "_", sanitized).strip("._")
+    return sanitized
+
+
+YEAR_PATTERN = re.compile(r"\b(19|20)\d{2}\b")
+TITLE_PATTERN = re.compile(r"\.\s+([A-Z][^.]+?)\.\s+[A-Z]")
+
+
+def derive_title(reference: str) -> str:
+    """Attempt to extract the study title from a reference string."""
+
+    cleaned = REFERENCE_LEAD_PATTERN.sub("", reference).strip()
+    if not cleaned:
+        return ""
+
+    pre_url = cleaned.split("http", 1)[0].strip()
+    search_scope = pre_url
+
+    match = TITLE_PATTERN.search(pre_url)
+    if match:
+        candidate = match.group(1).strip()
+    else:
+        year_match = YEAR_PATTERN.search(pre_url)
+        if year_match:
+            search_scope = pre_url[: year_match.start()].rstrip("., ;")
+        else:
+            search_scope = pre_url
+
+        segments = [
+            segment.strip() for segment in search_scope.split(". ") if segment.strip()
+        ]
+
+        candidate = ""
+        for segment in segments:
+            if segment.count(";") >= 1 and segment.count(" ") <= 3:
+                continue
+            if len(segment.split()) >= 3:
+                candidate = segment
+                break
+
+        if not candidate:
+            candidate = segments[0] if segments else pre_url
+
+        candidate = candidate.strip(" .;:,-")
+
+    return candidate
+
+
+@dataclass
+class DownloadResult:
+    target: str
+    success: bool
+    message: str
+    destination: Optional[Path] = None
+
+
+@dataclass
+class ReferenceTask:
+    index: int
+    reference: str
+    output_name: str
+    preview: str
+
+
+def create_failure_report(destination: Path, failures: List["DownloadResult"]) -> Optional[Path]:
+    """Write a text document listing references that did not download."""
+
+    if not failures:
+        return None
+
+    destination.mkdir(parents=True, exist_ok=True)
+    report_path = _dedupe_path(destination / "missing_pdfs.txt")
+
+    lines: List[str] = []
+    for idx, failure in enumerate(failures, start=1):
+        lines.append(f"{idx}. {failure.target}")
+        if failure.message:
+            lines.append(f"   Reason: {failure.message}")
+        lines.append("")
+
+    report_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+    return report_path
+
+
+def _dedupe_path(path: Path) -> Path:
+    counter = 1
+    final_path = path
+    while final_path.exists():
+        final_path = path.with_name(f"{path.stem}_{counter}{path.suffix}")
+        counter += 1
+    return final_path
+
+
+def get_default_download_dir() -> Path:
+    """Best-effort guess of the user's default download directory."""
+
+    if sys.platform.startswith("win"):
+        return Path.home() / "Downloads"
+    if sys.platform == "darwin":
+        return Path.home() / "Downloads"
+    # Assume XDG-style layout for Linux/Unix platforms.
+    return Path.home() / "Downloads"
+
+
+def wait_for_manual_pdf(
+    download_dir: Path,
+    existing_files: set[Path],
+    timeout: float,
+    skip_event: Optional[threading.Event] = None,
+) -> Optional[Path]:
+    """Poll the user's download directory for a new PDF file."""
+
+    deadline = time.time() + max(timeout, 1.0)
+    resolved_existing = {p.resolve() for p in existing_files}
+    size_tracker: dict[Path, int] = {}
+    stable_counts: dict[Path, int] = {}
+
+    while time.time() < deadline:
+        if skip_event is not None and skip_event.is_set():
+            raise SkipRequested()
+
+        for candidate in download_dir.glob("*.pdf"):
+            try:
+                resolved = candidate.resolve()
+            except FileNotFoundError:
+                continue
+            if resolved in resolved_existing:
+                continue
+            try:
+                size = resolved.stat().st_size
+            except OSError:
+                continue
+            previous_size = size_tracker.get(resolved)
+            if previous_size is not None and size == previous_size:
+                stable_counts[resolved] = stable_counts.get(resolved, 0) + 1
+            else:
+                stable_counts[resolved] = 0
+            size_tracker[resolved] = size
+            if stable_counts[resolved] >= 1:
+                return resolved
+
+        time.sleep(1)
+
+    return None
+
+
+def _merge_failure_messages(initial: str, retry: str) -> str:
+    parts: List[str] = []
+    if initial:
+        parts.append(f"initial attempt: {initial}")
+    if retry:
+        parts.append(f"retry attempt: {retry}")
+    return "; ".join(parts) if parts else ""
+
+
+class SkipRequested(Exception):
+    """Raised when the user requests to skip the current download."""
+
+
+class PDFDownloader:
+    """Handles Selenium browser automation to download PDF files via Google Scholar."""
+
+    SCHOLAR_URL = "https://scholar.google.com/"
+    CHALLENGE_TIMEOUT = 180
+
+    def __init__(
+        self,
+        download_dir: Path,
+        challenge_callback: Optional[Callable[[str], None]] = None,
+        download_timeout: float = 30.0,
+    ) -> None:
+        if webdriver is None:
+            raise RuntimeError(
+                "Selenium is not available. Please install it via 'pip install selenium' "
+                "and ensure geckodriver/Firefox are installed."
+            )
+        self.download_dir = download_dir
+        self.driver = self._create_driver(download_dir)
+        self.base_handle = self.driver.current_window_handle
+        self.challenge_callback = challenge_callback
+        self.download_timeout = max(1.0, float(download_timeout))
+
+    @staticmethod
+    def _create_driver(download_dir: Path) -> "webdriver.Firefox":
+        options = FirefoxOptions()
+        options.set_preference("browser.download.folderList", 2)
+        options.set_preference("browser.download.dir", str(download_dir))
+        options.set_preference("browser.helperApps.neverAsk.saveToDisk", "application/pdf")
+        options.set_preference("pdfjs.disabled", True)
+        options.set_preference("browser.download.manager.showWhenStarting", False)
+        options.set_preference("browser.download.useDownloadDir", True)
+
+        driver = webdriver.Firefox(options=options)
+        driver.maximize_window()
+        return driver
+
+    def close(self) -> None:
+        try:
+            self.driver.quit()
+        except Exception:
+            pass
+
+    def download(
+        self,
+        reference: str,
+        output_name: str,
+        final_dir: Path,
+        skip_event: Optional[threading.Event] = None,
+    ) -> DownloadResult:
+        existing_files = {p for p in self.download_dir.iterdir() if p.is_file()}
+        try:
+            self._search_reference(reference, skip_event)
+        except SkipRequested:
+            return DownloadResult(reference, False, "Skipped by user")
+        except WebDriverException as exc:  # pragma: no cover - runtime protection
+            return DownloadResult(reference, False, f"Failed to open Google Scholar: {exc}")
+
+        try:
+            result_block = self._get_first_result(skip_event)
+        except SkipRequested:
+            return DownloadResult(reference, False, "Skipped by user")
+        except TimeoutException:
+            return DownloadResult(reference, False, "No Google Scholar results were found")
+
+        try:
+            pdf_link = self._extract_pdf_link(result_block)
+        except WebDriverException as exc:
+            return DownloadResult(reference, False, f"Unable to inspect the first result: {exc}")
+
+        article_handle: Optional[str] = None
+        article_opened_in_new_tab = False
+
+        if pdf_link is None:
+            try:
+                article_link = result_block.find_element(By.CSS_SELECTOR, "h3 a")
+            except NoSuchElementException:
+                return DownloadResult(
+                    reference, False, "First result is missing an article link to follow"
+                )
+
+            try:
+                article_handle, article_opened_in_new_tab = self._open_article_link(
+                    article_link, skip_event
+                )
+            except SkipRequested:
+                return DownloadResult(reference, False, "Skipped by user")
+
+            try:
+                pdf_link = self._wait_for_pdf_link(skip_event)
+            except SkipRequested:
+                return DownloadResult(reference, False, "Skipped by user")
+            except TimeoutException:
+                return DownloadResult(
+                    reference,
+                    False,
+                    "Could not locate a PDF link on the article page",
+                )
+
+        if pdf_link is None:
+            return DownloadResult(
+                reference,
+                False,
+                "First result did not provide a downloadable PDF",
+            )
+
+        try:
+            self.driver.execute_script("arguments[0].click();", pdf_link)
+        except WebDriverException as exc:
+            return DownloadResult(reference, False, f"Failed to trigger PDF download: {exc}")
+
+        try:
+            downloaded = self._wait_for_new_file(existing_files, skip_event)
+        except SkipRequested:
+            return DownloadResult(reference, False, "Skipped by user")
+        if downloaded is None:
+            return DownloadResult(reference, False, "Download did not complete in time")
+
+        if article_opened_in_new_tab and article_handle:
+            self._close_tab(article_handle)
+
+        self._close_extra_tabs()
+
+        destination = final_dir / f"{output_name}.pdf"
+        destination = self._dedupe_destination(destination)
+        shutil.move(str(downloaded), destination)
+        return DownloadResult(reference, True, "Downloaded", destination)
+
+    def _search_reference(
+        self, reference: str, skip_event: Optional[threading.Event] = None
+    ) -> None:
+        try:
+            self.driver.switch_to.window(self.base_handle)
+        except WebDriverException:
+            pass
+        self.driver.get(self.SCHOLAR_URL)
+        self._handle_challenge(
+            "Google Scholar asked for verification before the search box became available.",
+            skip_event,
+        )
+
+        def locate_box(driver):
+            self._check_skip(skip_event)
+            return driver.find_element(By.NAME, "q")
+
+        wait = WebDriverWait(self.driver, 20)
+        search_box = wait.until(locate_box)
+        search_box.clear()
+        search_box.send_keys(reference)
+        search_box.submit()
+        self._handle_challenge(
+            "Google Scholar requested verification after submitting the query.",
+            skip_event,
+        )
+
+    def _get_first_result(self, skip_event: Optional[threading.Event] = None):
+        deadline = time.time() + 60
+        last_exception: Optional[Exception] = None
+        while time.time() < deadline:
+            self._check_skip(skip_event)
+            self._handle_challenge(
+                "Google Scholar needs verification before showing the search results.",
+                skip_event,
+            )
+            wait = WebDriverWait(self.driver, 10)
+            try:
+                return wait.until(
+                    lambda drv: self._locate_first_result(drv, skip_event)
+                )
+            except TimeoutException as exc:
+                last_exception = exc
+        if last_exception:
+            raise last_exception
+        raise TimeoutException("No Google Scholar results were found")
+
+    def _locate_first_result(
+        self, driver, skip_event: Optional[threading.Event]
+    ):
+        self._check_skip(skip_event)
+        elements = driver.find_elements(By.CSS_SELECTOR, "div.gs_r.gs_or.gs_scl")
+        return elements[0] if elements else False
+
+    @staticmethod
+    def _extract_pdf_link(result_block):
+        try:
+            return result_block.find_element(By.CSS_SELECTOR, "div.gs_or_ggsm a")
+        except NoSuchElementException:
+            return None
+
+    def _open_article_link(
+        self, link, skip_event: Optional[threading.Event] = None
+    ):
+        existing_handles = set(self.driver.window_handles)
+        try:
+            self.driver.execute_script("arguments[0].click();", link)
+        except WebDriverException:
+            link.click()
+
+        new_handle = self._wait_for_new_window(existing_handles, skip_event)
+        if new_handle:
+            self.driver.switch_to.window(new_handle)
+            return new_handle, True
+        return self.driver.current_window_handle, False
+
+    def _wait_for_pdf_link(
+        self, skip_event: Optional[threading.Event] = None
+    ):
+        wait = WebDriverWait(self.driver, 20, poll_frequency=0.5)
+
+        def locate(driver):
+            self._check_skip(skip_event)
+            candidates = driver.find_elements(
+                By.XPATH,
+                "//a[contains(@href, '.pdf') or contains(translate(text(), 'pdf', 'PDF'), 'PDF')]",
+            )
+            for candidate in candidates:
+                try:
+                    if candidate.is_enabled() and candidate.is_displayed():
+                        return candidate
+                except WebDriverException:
+                    continue
+            return False
+
+        return wait.until(locate)
+
+    def _wait_for_new_file(
+        self, existing_files: set[Path], skip_event: Optional[threading.Event] = None
+    ) -> Optional[Path]:
+        timeout = time.time() + self.download_timeout
+        while time.time() < timeout:
+            self._check_skip(skip_event)
+            current_files = {p for p in self.download_dir.iterdir() if p.is_file()}
+            new_files = current_files - existing_files
+            for candidate in new_files:
+                if candidate.suffix.lower() == ".pdf" and not candidate.name.endswith(".part"):
+                    return candidate
+            time.sleep(1)
+        return None
+
+    def _wait_for_new_window(
+        self, existing_handles: set[str], skip_event: Optional[threading.Event] = None
+    ) -> Optional[str]:
+        end = time.time() + 10
+        while time.time() < end:
+            self._check_skip(skip_event)
+            handles = set(self.driver.window_handles)
+            new_handles = handles - existing_handles
+            if new_handles:
+                return new_handles.pop()
+            time.sleep(0.5)
+        return None
+
+    def _close_tab(self, handle: str) -> None:
+        try:
+            self.driver.switch_to.window(handle)
+            self.driver.close()
+        except WebDriverException:
+            pass
+        finally:
+            try:
+                self.driver.switch_to.window(self.base_handle)
+            except WebDriverException:
+                pass
+
+    def _close_extra_tabs(self) -> None:
+        for handle in list(self.driver.window_handles):
+            if handle == self.base_handle:
+                continue
+            self._close_tab(handle)
+        try:
+            self.driver.switch_to.window(self.base_handle)
+        except WebDriverException:
+            pass
+
+    @staticmethod
+    def _dedupe_destination(path: Path) -> Path:
+        return _dedupe_path(path)
+
+    def _handle_challenge(
+        self, context: str, skip_event: Optional[threading.Event] = None
+    ) -> None:
+        if not self._is_challenge_page():
+            return
+
+        message = (
+            "Google Scholar is requesting verification (e.g., an 'I'm not a robot' "
+            "challenge). "
+            f"{context}"
+            "\n\nPlease switch to the Firefox window, complete the verification, and then "
+            "return to this application."
+        )
+        if self.challenge_callback is not None:
+            try:
+                self.challenge_callback(message)
+            except Exception:
+                pass
+
+        deadline = time.time() + self.CHALLENGE_TIMEOUT
+        while time.time() < deadline:
+            self._check_skip(skip_event)
+            time.sleep(1)
+            if not self._is_challenge_page():
+                return
+
+        raise TimeoutException("Verification challenge was not cleared in time")
+
+    @staticmethod
+    def _check_skip(skip_event: Optional[threading.Event]) -> None:
+        if skip_event is not None and skip_event.is_set():
+            raise SkipRequested()
+
+    def _is_challenge_page(self) -> bool:
+        try:
+            source = self.driver.page_source
+            current_url = self.driver.current_url
+        except WebDriverException:
+            return False
+
+        return page_requires_verification(source, current_url)
+
+
+class App(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Fetch Bibliography PDFs")
+        self.geometry("700x500")
+        self.minsize(500, 400)
+        self.resizable(True, True)
+        self.download_thread: Optional[threading.Thread] = None
+        self.downloader: Optional[PDFDownloader] = None
+        self._skip_event = threading.Event()
+        self.manual_retry_var = tk.BooleanVar(value=False)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        instruction = tk.Label(
+            self, text="Paste your bibliography entries below (one per line):"
+        )
+        instruction.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 0))
+
+        self.text_box = scrolledtext.ScrolledText(self, wrap=tk.WORD)
+        self.text_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+
+        path_frame = tk.Frame(self)
+        path_frame.grid(row=2, column=0, sticky="ew", padx=10)
+        path_frame.columnconfigure(1, weight=1)
+
+        tk.Label(path_frame, text="Destination folder:").grid(row=0, column=0, sticky="w")
+        self.path_var = tk.StringVar(value=str(Path.home() / "Desktop" / "Bibliography_PDFs"))
+        self.path_entry = tk.Entry(path_frame, textvariable=self.path_var)
+        self.path_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        tk.Button(path_frame, text="Browse", command=self._choose_folder).grid(
+            row=0, column=2, padx=(0, 5)
+        )
+
+        tk.Label(path_frame, text="Download timeout (seconds):").grid(
+            row=1, column=0, sticky="w"
+        )
+        self.timeout_var = tk.StringVar(value="30")
+        self.timeout_entry = tk.Entry(path_frame, textvariable=self.timeout_var, width=10)
+        self.timeout_entry.grid(row=1, column=1, sticky="w", padx=5, pady=(0, 5))
+
+        manual_check = tk.Checkbutton(
+            path_frame,
+            text="Offer manual browser fallback for missed PDFs",
+            variable=self.manual_retry_var,
+        )
+        manual_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 5))
+
+        controls_frame = tk.Frame(self)
+        controls_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(5, 10))
+        controls_frame.columnconfigure(0, weight=1)
+
+        self.status_var = tk.StringVar(value="Idle")
+        status_label = tk.Label(controls_frame, textvariable=self.status_var, anchor="w")
+        status_label.grid(row=0, column=0, sticky="w")
+
+        self.download_button = tk.Button(
+            controls_frame, text="Download PDFs", command=self._start_download
+        )
+        self.download_button.grid(row=0, column=1, padx=(10, 0))
+
+        self.skip_button = tk.Button(
+            controls_frame,
+            text="Skip ▶",
+            command=self._request_skip,
+            state=tk.DISABLED,
+        )
+        self.skip_button.grid(row=0, column=2, padx=(10, 0))
+
+    def _choose_folder(self) -> None:
+        selected = filedialog.askdirectory(initialdir=self.path_var.get())
+        if selected:
+            self.path_var.set(selected)
+
+    def _start_download(self) -> None:
+        if self.download_thread and self.download_thread.is_alive():
+            messagebox.showinfo(
+                "Download in progress", "Please wait for the current download to finish."
+            )
+            return
+
+        references = extract_references(self.text_box.get("1.0", tk.END))
+        if not references:
+            messagebox.showwarning(
+                "No references", "No bibliography entries were detected in the provided text."
+            )
+            return
+
+        destination = Path(self.path_var.get()).expanduser()
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Invalid folder", f"Could not create destination: {exc}")
+            return
+
+        try:
+            timeout_seconds = float(self.timeout_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid timeout",
+                "Please enter a numeric timeout value (in seconds).",
+            )
+            return
+
+        if timeout_seconds <= 0:
+            messagebox.showerror(
+                "Invalid timeout", "Timeout must be greater than zero seconds."
+            )
+            return
+
+        self.status_var.set("Starting downloads...")
+        self.download_button.config(state=tk.DISABLED)
+        self.skip_button.config(state=tk.NORMAL)
+        self._skip_event.clear()
+        self.download_thread = threading.Thread(
+            target=self._run_downloads,
+            args=(references, destination, timeout_seconds),
+            daemon=True,
+        )
+        self.download_thread.start()
+
+    def _run_downloads(
+        self, references: List[str], destination: Path, timeout_seconds: float
+    ) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="fetch_pdfs_"))
+        tasks: List[ReferenceTask] = []
+        for index, reference in enumerate(references, start=1):
+            title = derive_title(reference)
+            sanitized_title = _sanitize_filename(title)[:150] if title else ""
+            output_name = sanitized_title if sanitized_title else f"reference_{index:03d}"
+            preview = reference if len(reference) <= 80 else reference[:77] + "..."
+            tasks.append(ReferenceTask(index, reference, output_name, preview))
+
+        final_results: List[Optional[DownloadResult]] = [None] * len(tasks)
+        retry_successes: List[ReferenceTask] = []
+        retry_candidates: List[tuple[int, ReferenceTask, DownloadResult]] = []
+        manual_successes: List[ReferenceTask] = []
+
+        try:
+            self.downloader = PDFDownloader(
+                temp_dir, self._prompt_challenge, download_timeout=timeout_seconds
+            )
+            for task in tasks:
+                self._update_status(
+                    f"Processing {task.index}/{len(references)}: {task.preview}"
+                )
+                result = self.downloader.download(
+                    task.reference,
+                    task.output_name,
+                    destination,
+                    skip_event=self._skip_event,
+                )
+                self._skip_event.clear()
+                final_results[task.index - 1] = result
+                if not result.success:
+                    retry_candidates.append((task.index - 1, task, result))
+
+            if retry_candidates:
+                self._update_status(
+                    f"Retrying {len(retry_candidates)} reference(s) that failed initially..."
+                )
+                for slot, task, first_result in retry_candidates:
+                    self._update_status(
+                        f"Retrying {task.index}/{len(references)}: {task.preview}"
+                    )
+                    retry_result = self.downloader.download(
+                        task.reference,
+                        task.output_name,
+                        destination,
+                        skip_event=self._skip_event,
+                    )
+                    self._skip_event.clear()
+                    if retry_result.success:
+                        retry_result.message = "Downloaded on retry"
+                        final_results[slot] = retry_result
+                        retry_successes.append(task)
+                    else:
+                        retry_result.message = _merge_failure_messages(
+                            first_result.message, retry_result.message
+                        )
+                        final_results[slot] = retry_result
+
+            if self.manual_retry_var.get():
+                manual_successes = self._run_manual_fallback(
+                    tasks,
+                    final_results,
+                    destination,
+                    timeout_seconds,
+                )
+        except Exception as exc:  # pragma: no cover - GUI feedback only
+            error_message = str(exc)
+            for idx, value in enumerate(final_results):
+                if isinstance(value, DownloadResult):
+                    continue
+                reference = tasks[idx].reference if idx < len(tasks) else "Initialization"
+                final_results[idx] = DownloadResult(reference, False, error_message)
+            if not final_results:
+                final_results = [DownloadResult("Initialization", False, error_message)]
+            retry_successes = []
+        finally:
+            if self.downloader:
+                self.downloader.close()
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        results: List[DownloadResult]
+        if final_results and all(isinstance(r, DownloadResult) for r in final_results):
+            results = [r for r in final_results if isinstance(r, DownloadResult)]
+        else:
+            results = [DownloadResult("Initialization", False, "Downloader did not start")]  # pragma: no cover
+
+        success = sum(1 for r in results if r.success)
+        failures = [r for r in results if not r.success]
+
+        summary_lines = [f"Downloaded {success} of {len(references)} references."]
+        if retry_successes:
+            summary_lines.append(
+                f"{len(retry_successes)} reference(s) succeeded on a second attempt."
+            )
+        if manual_successes:
+            summary_lines.append(
+                f"{len(manual_successes)} reference(s) were completed via manual fallback."
+            )
+        for fail in failures:
+            summary_lines.append(f"- {fail.target}: {fail.message}")
+
+        report_path = create_failure_report(destination, failures)
+        if report_path:
+            summary_lines.append("")
+            summary_lines.append(
+                f"A list of missed PDFs was saved to: {report_path}"
+            )
+
+        self._finish(summary_lines)
+
+    def _run_manual_fallback(
+        self,
+        tasks: List[ReferenceTask],
+        final_results: List[Optional[DownloadResult]],
+        destination: Path,
+        timeout_seconds: float,
+    ) -> List[ReferenceTask]:
+        pending: List[tuple[int, ReferenceTask, DownloadResult]] = []
+        for idx, result in enumerate(final_results):
+            if isinstance(result, DownloadResult) and not result.success:
+                pending.append((idx, tasks[idx], result))
+
+        if not pending:
+            return []
+
+        downloads_dir = get_default_download_dir()
+        try:
+            downloads_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            note = f"Manual fallback unavailable ({exc})"
+            for idx, _task, previous in pending:
+                final_results[idx] = DownloadResult(
+                    previous.target,
+                    False,
+                    self._append_manual_note(previous.message, note),
+                )
+            self._update_status("Manual fallback could not start (downloads folder missing).")
+            return []
+
+        manual_successes: List[ReferenceTask] = []
+        total = len(tasks)
+        for idx, task, previous in pending:
+            self._update_status(
+                f"Manual fallback for {task.index}/{total}: {task.preview}"
+            )
+            manual_result = self._perform_manual_download(
+                task,
+                destination,
+                downloads_dir,
+                timeout_seconds,
+                previous.message,
+            )
+            self._skip_event.clear()
+            final_results[idx] = manual_result
+            if manual_result.success:
+                manual_successes.append(task)
+
+        if manual_successes:
+            self._update_status("Manual fallback completed.")
+
+        return manual_successes
+
+    def _perform_manual_download(
+        self,
+        task: ReferenceTask,
+        destination: Path,
+        downloads_dir: Path,
+        timeout_seconds: float,
+        previous_message: str,
+    ) -> DownloadResult:
+        proceed = self._prompt_manual_confirmation(task, downloads_dir, timeout_seconds)
+        if not proceed:
+            return DownloadResult(
+                task.reference,
+                False,
+                self._append_manual_note(
+                    previous_message, "Manual fallback skipped by user"
+                ),
+            )
+
+        query_url = f"{PDFDownloader.SCHOLAR_URL}scholar?q={quote_plus(task.reference)}"
+        try:
+            webbrowser.open_new_tab(query_url)
+        except Exception as exc:  # pragma: no cover - OS/browser specific
+            return DownloadResult(
+                task.reference,
+                False,
+                self._append_manual_note(
+                    previous_message, f"Could not open browser ({exc})"
+                ),
+            )
+
+        existing_files = {p.resolve() for p in downloads_dir.glob("*.pdf")}
+        self._update_status(
+            f"Waiting for manual download in {downloads_dir}: {task.preview}"
+        )
+
+        try:
+            manual_file = wait_for_manual_pdf(
+                downloads_dir,
+                existing_files,
+                timeout_seconds,
+                skip_event=self._skip_event,
+            )
+        except SkipRequested:
+            return DownloadResult(
+                task.reference,
+                False,
+                self._append_manual_note(
+                    previous_message, "Skipped during manual fallback"
+                ),
+            )
+
+        if manual_file is None:
+            return DownloadResult(
+                task.reference,
+                False,
+                self._append_manual_note(
+                    previous_message, "Manual fallback timed out"
+                ),
+            )
+
+        destination_path = _dedupe_path(destination / f"{task.output_name}.pdf")
+        try:
+            shutil.move(str(manual_file), destination_path)
+        except OSError as exc:
+            return DownloadResult(
+                task.reference,
+                False,
+                self._append_manual_note(
+                    previous_message, f"Could not move manual download ({exc})"
+                ),
+            )
+
+        return DownloadResult(
+            task.reference, True, "Downloaded manually", destination_path
+        )
+
+    def _prompt_manual_confirmation(
+        self, task: ReferenceTask, downloads_dir: Path, timeout_seconds: float
+    ) -> bool:
+        event = threading.Event()
+        decision = {"proceed": False}
+
+        def prompt() -> None:
+            message = (
+                "Automated attempts were unable to fetch this reference:\n\n"
+                f"{task.reference}\n\n"
+                "Click Yes to open the search in your default browser so you can "
+                "download the PDF manually. Save the PDF into the folder:\n"
+                f"{downloads_dir}\n\n"
+                f"The app will watch for a new PDF there for up to {int(timeout_seconds)} seconds."
+            )
+            decision["proceed"] = messagebox.askyesno(
+                "Manual download required", message
+            )
+            event.set()
+
+        self.after(0, prompt)
+        event.wait()
+        return decision["proceed"]
+
+    @staticmethod
+    def _append_manual_note(previous: str, note: str) -> str:
+        return f"{previous}; {note}" if previous else note
+
+    def _update_status(self, text: str) -> None:
+        def updater() -> None:
+            self.status_var.set(text)
+
+        self.after(0, updater)
+
+    def _finish(self, summary_lines: Iterable[str]) -> None:
+        def finish_ui() -> None:
+            self.download_button.config(state=tk.NORMAL)
+            self.skip_button.config(state=tk.DISABLED)
+            self.status_var.set("Done")
+            messagebox.showinfo("Download summary", "\n".join(summary_lines))
+
+        self.after(0, finish_ui)
+
+    def _prompt_challenge(self, message: str) -> None:
+        event = threading.Event()
+
+        def show_message() -> None:
+            self.status_var.set(
+                "Waiting for manual verification in Firefox (complete the challenge and click OK)..."
+            )
+            messagebox.showinfo("Manual verification required", message)
+            event.set()
+
+        self.after(0, show_message)
+        event.wait()
+        self._update_status("Resuming downloads...")
+
+    def _request_skip(self) -> None:
+        if not (self.download_thread and self.download_thread.is_alive()):
+            return
+        self._skip_event.set()
+        self._update_status("Skip requested. Moving to the next reference...")
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
