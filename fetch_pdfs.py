@@ -209,6 +209,10 @@ def _merge_failure_messages(initial: str, retry: str) -> str:
     return "; ".join(parts) if parts else ""
 
 
+class SkipRequested(Exception):
+    """Raised when the user requests to skip the current download."""
+
+
 class PDFDownloader:
     """Handles Selenium browser automation to download PDF files via Google Scholar."""
 
@@ -219,6 +223,7 @@ class PDFDownloader:
         self,
         download_dir: Path,
         challenge_callback: Optional[Callable[[str], None]] = None,
+        download_timeout: float = 30.0,
     ) -> None:
         if webdriver is None:
             raise RuntimeError(
@@ -229,6 +234,7 @@ class PDFDownloader:
         self.driver = self._create_driver(download_dir)
         self.base_handle = self.driver.current_window_handle
         self.challenge_callback = challenge_callback
+        self.download_timeout = max(1.0, float(download_timeout))
 
     @staticmethod
     def _create_driver(download_dir: Path) -> "webdriver.Firefox":
@@ -250,15 +256,25 @@ class PDFDownloader:
         except Exception:
             pass
 
-    def download(self, reference: str, output_name: str, final_dir: Path) -> DownloadResult:
+    def download(
+        self,
+        reference: str,
+        output_name: str,
+        final_dir: Path,
+        skip_event: Optional[threading.Event] = None,
+    ) -> DownloadResult:
         existing_files = {p for p in self.download_dir.iterdir() if p.is_file()}
         try:
-            self._search_reference(reference)
+            self._search_reference(reference, skip_event)
+        except SkipRequested:
+            return DownloadResult(reference, False, "Skipped by user")
         except WebDriverException as exc:  # pragma: no cover - runtime protection
             return DownloadResult(reference, False, f"Failed to open Google Scholar: {exc}")
 
         try:
-            result_block = self._get_first_result()
+            result_block = self._get_first_result(skip_event)
+        except SkipRequested:
+            return DownloadResult(reference, False, "Skipped by user")
         except TimeoutException:
             return DownloadResult(reference, False, "No Google Scholar results were found")
 
@@ -278,10 +294,17 @@ class PDFDownloader:
                     reference, False, "First result is missing an article link to follow"
                 )
 
-            article_handle, article_opened_in_new_tab = self._open_article_link(article_link)
+            try:
+                article_handle, article_opened_in_new_tab = self._open_article_link(
+                    article_link, skip_event
+                )
+            except SkipRequested:
+                return DownloadResult(reference, False, "Skipped by user")
 
             try:
-                pdf_link = self._wait_for_pdf_link()
+                pdf_link = self._wait_for_pdf_link(skip_event)
+            except SkipRequested:
+                return DownloadResult(reference, False, "Skipped by user")
             except TimeoutException:
                 return DownloadResult(
                     reference,
@@ -301,7 +324,10 @@ class PDFDownloader:
         except WebDriverException as exc:
             return DownloadResult(reference, False, f"Failed to trigger PDF download: {exc}")
 
-        downloaded = self._wait_for_new_file(existing_files)
+        try:
+            downloaded = self._wait_for_new_file(existing_files, skip_event)
+        except SkipRequested:
+            return DownloadResult(reference, False, "Skipped by user")
         if downloaded is None:
             return DownloadResult(reference, False, "Download did not complete in time")
 
@@ -315,43 +341,59 @@ class PDFDownloader:
         shutil.move(str(downloaded), destination)
         return DownloadResult(reference, True, "Downloaded", destination)
 
-    def _search_reference(self, reference: str) -> None:
+    def _search_reference(
+        self, reference: str, skip_event: Optional[threading.Event] = None
+    ) -> None:
         try:
             self.driver.switch_to.window(self.base_handle)
         except WebDriverException:
             pass
         self.driver.get(self.SCHOLAR_URL)
         self._handle_challenge(
-            "Google Scholar asked for verification before the search box became available."
+            "Google Scholar asked for verification before the search box became available.",
+            skip_event,
         )
+
+        def locate_box(driver):
+            self._check_skip(skip_event)
+            return driver.find_element(By.NAME, "q")
+
         wait = WebDriverWait(self.driver, 20)
-        search_box = wait.until(EC.presence_of_element_located((By.NAME, "q")))
+        search_box = wait.until(locate_box)
         search_box.clear()
         search_box.send_keys(reference)
         search_box.submit()
         self._handle_challenge(
-            "Google Scholar requested verification after submitting the query."
+            "Google Scholar requested verification after submitting the query.",
+            skip_event,
         )
 
-    def _get_first_result(self):
+    def _get_first_result(self, skip_event: Optional[threading.Event] = None):
         deadline = time.time() + 60
         last_exception: Optional[Exception] = None
         while time.time() < deadline:
+            self._check_skip(skip_event)
             self._handle_challenge(
-                "Google Scholar needs verification before showing the search results."
+                "Google Scholar needs verification before showing the search results.",
+                skip_event,
             )
             wait = WebDriverWait(self.driver, 10)
             try:
                 return wait.until(
-                    EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, "div.gs_r.gs_or.gs_scl")
-                    )
+                    lambda drv: self._locate_first_result(drv, skip_event)
                 )
             except TimeoutException as exc:
                 last_exception = exc
         if last_exception:
             raise last_exception
         raise TimeoutException("No Google Scholar results were found")
+
+    def _locate_first_result(
+        self, driver, skip_event: Optional[threading.Event]
+    ):
+        self._check_skip(skip_event)
+        elements = driver.find_elements(By.CSS_SELECTOR, "div.gs_r.gs_or.gs_scl")
+        return elements[0] if elements else False
 
     @staticmethod
     def _extract_pdf_link(result_block):
@@ -360,33 +402,48 @@ class PDFDownloader:
         except NoSuchElementException:
             return None
 
-    def _open_article_link(self, link):
+    def _open_article_link(
+        self, link, skip_event: Optional[threading.Event] = None
+    ):
         existing_handles = set(self.driver.window_handles)
         try:
             self.driver.execute_script("arguments[0].click();", link)
         except WebDriverException:
             link.click()
 
-        new_handle = self._wait_for_new_window(existing_handles)
+        new_handle = self._wait_for_new_window(existing_handles, skip_event)
         if new_handle:
             self.driver.switch_to.window(new_handle)
             return new_handle, True
         return self.driver.current_window_handle, False
 
-    def _wait_for_pdf_link(self):
-        wait = WebDriverWait(self.driver, 20)
-        return wait.until(
-            EC.element_to_be_clickable(
-                (
-                    By.XPATH,
-                    "//a[contains(@href, '.pdf') or contains(translate(text(), 'pdf', 'PDF'), 'PDF')]",
-                )
-            )
-        )
+    def _wait_for_pdf_link(
+        self, skip_event: Optional[threading.Event] = None
+    ):
+        wait = WebDriverWait(self.driver, 20, poll_frequency=0.5)
 
-    def _wait_for_new_file(self, existing_files: set[Path]) -> Optional[Path]:
-        timeout = time.time() + 60
+        def locate(driver):
+            self._check_skip(skip_event)
+            candidates = driver.find_elements(
+                By.XPATH,
+                "//a[contains(@href, '.pdf') or contains(translate(text(), 'pdf', 'PDF'), 'PDF')]",
+            )
+            for candidate in candidates:
+                try:
+                    if candidate.is_enabled() and candidate.is_displayed():
+                        return candidate
+                except WebDriverException:
+                    continue
+            return False
+
+        return wait.until(locate)
+
+    def _wait_for_new_file(
+        self, existing_files: set[Path], skip_event: Optional[threading.Event] = None
+    ) -> Optional[Path]:
+        timeout = time.time() + self.download_timeout
         while time.time() < timeout:
+            self._check_skip(skip_event)
             current_files = {p for p in self.download_dir.iterdir() if p.is_file()}
             new_files = current_files - existing_files
             for candidate in new_files:
@@ -395,9 +452,12 @@ class PDFDownloader:
             time.sleep(1)
         return None
 
-    def _wait_for_new_window(self, existing_handles: set[str]) -> Optional[str]:
+    def _wait_for_new_window(
+        self, existing_handles: set[str], skip_event: Optional[threading.Event] = None
+    ) -> Optional[str]:
         end = time.time() + 10
         while time.time() < end:
+            self._check_skip(skip_event)
             handles = set(self.driver.window_handles)
             new_handles = handles - existing_handles
             if new_handles:
@@ -431,7 +491,9 @@ class PDFDownloader:
     def _dedupe_destination(path: Path) -> Path:
         return _dedupe_path(path)
 
-    def _handle_challenge(self, context: str) -> None:
+    def _handle_challenge(
+        self, context: str, skip_event: Optional[threading.Event] = None
+    ) -> None:
         if not self._is_challenge_page():
             return
 
@@ -450,11 +512,17 @@ class PDFDownloader:
 
         deadline = time.time() + self.CHALLENGE_TIMEOUT
         while time.time() < deadline:
+            self._check_skip(skip_event)
             time.sleep(1)
             if not self._is_challenge_page():
                 return
 
         raise TimeoutException("Verification challenge was not cleared in time")
+
+    @staticmethod
+    def _check_skip(skip_event: Optional[threading.Event]) -> None:
+        if skip_event is not None and skip_event.is_set():
+            raise SkipRequested()
 
     def _is_challenge_page(self) -> bool:
         try:
@@ -475,6 +543,7 @@ class App(tk.Tk):
         self.resizable(True, True)
         self.download_thread: Optional[threading.Thread] = None
         self.downloader: Optional[PDFDownloader] = None
+        self._skip_event = threading.Event()
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -501,6 +570,13 @@ class App(tk.Tk):
             row=0, column=2, padx=(0, 5)
         )
 
+        tk.Label(path_frame, text="Download timeout (seconds):").grid(
+            row=1, column=0, sticky="w"
+        )
+        self.timeout_var = tk.StringVar(value="30")
+        self.timeout_entry = tk.Entry(path_frame, textvariable=self.timeout_var, width=10)
+        self.timeout_entry.grid(row=1, column=1, sticky="w", padx=5, pady=(0, 5))
+
         controls_frame = tk.Frame(self)
         controls_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(5, 10))
         controls_frame.columnconfigure(0, weight=1)
@@ -514,6 +590,14 @@ class App(tk.Tk):
         )
         self.download_button.grid(row=0, column=1, padx=(10, 0))
 
+        self.skip_button = tk.Button(
+            controls_frame,
+            text="Skip ▶",
+            command=self._request_skip,
+            state=tk.DISABLED,
+        )
+        self.skip_button.grid(row=0, column=2, padx=(10, 0))
+
     def _choose_folder(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.path_var.get())
         if selected:
@@ -521,7 +605,9 @@ class App(tk.Tk):
 
     def _start_download(self) -> None:
         if self.download_thread and self.download_thread.is_alive():
-            messagebox.showinfo("Download in progress", "Please wait for current download to finish.")
+            messagebox.showinfo(
+                "Download in progress", "Please wait for the current download to finish."
+            )
             return
 
         references = extract_references(self.text_box.get("1.0", tk.END))
@@ -532,16 +618,41 @@ class App(tk.Tk):
             return
 
         destination = Path(self.path_var.get()).expanduser()
-        destination.mkdir(parents=True, exist_ok=True)
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Invalid folder", f"Could not create destination: {exc}")
+            return
+
+        try:
+            timeout_seconds = float(self.timeout_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid timeout",
+                "Please enter a numeric timeout value (in seconds).",
+            )
+            return
+
+        if timeout_seconds <= 0:
+            messagebox.showerror(
+                "Invalid timeout", "Timeout must be greater than zero seconds."
+            )
+            return
 
         self.status_var.set("Starting downloads...")
         self.download_button.config(state=tk.DISABLED)
+        self.skip_button.config(state=tk.NORMAL)
+        self._skip_event.clear()
         self.download_thread = threading.Thread(
-            target=self._run_downloads, args=(references, destination), daemon=True
+            target=self._run_downloads,
+            args=(references, destination, timeout_seconds),
+            daemon=True,
         )
         self.download_thread.start()
 
-    def _run_downloads(self, references: List[str], destination: Path) -> None:
+    def _run_downloads(
+        self, references: List[str], destination: Path, timeout_seconds: float
+    ) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="fetch_pdfs_"))
         tasks: List[ReferenceTask] = []
         for index, reference in enumerate(references, start=1):
@@ -556,14 +667,20 @@ class App(tk.Tk):
         retry_candidates: List[tuple[int, ReferenceTask, DownloadResult]] = []
 
         try:
-            self.downloader = PDFDownloader(temp_dir, self._prompt_challenge)
+            self.downloader = PDFDownloader(
+                temp_dir, self._prompt_challenge, download_timeout=timeout_seconds
+            )
             for task in tasks:
                 self._update_status(
                     f"Processing {task.index}/{len(references)}: {task.preview}"
                 )
                 result = self.downloader.download(
-                    task.reference, task.output_name, destination
+                    task.reference,
+                    task.output_name,
+                    destination,
+                    skip_event=self._skip_event,
                 )
+                self._skip_event.clear()
                 final_results[task.index - 1] = result
                 if not result.success:
                     retry_candidates.append((task.index - 1, task, result))
@@ -577,8 +694,12 @@ class App(tk.Tk):
                         f"Retrying {task.index}/{len(references)}: {task.preview}"
                     )
                     retry_result = self.downloader.download(
-                        task.reference, task.output_name, destination
+                        task.reference,
+                        task.output_name,
+                        destination,
+                        skip_event=self._skip_event,
                     )
+                    self._skip_event.clear()
                     if retry_result.success:
                         retry_result.message = "Downloaded on retry"
                         final_results[slot] = retry_result
@@ -638,6 +759,7 @@ class App(tk.Tk):
     def _finish(self, summary_lines: Iterable[str]) -> None:
         def finish_ui() -> None:
             self.download_button.config(state=tk.NORMAL)
+            self.skip_button.config(state=tk.DISABLED)
             self.status_var.set("Done")
             messagebox.showinfo("Download summary", "\n".join(summary_lines))
 
@@ -656,6 +778,12 @@ class App(tk.Tk):
         self.after(0, show_message)
         event.wait()
         self._update_status("Resuming downloads...")
+
+    def _request_skip(self) -> None:
+        if not (self.download_thread and self.download_thread.is_alive()):
+            return
+        self._skip_event.set()
+        self._update_status("Skip requested. Moving to the next reference...")
 
 
 if __name__ == "__main__":
