@@ -7,13 +7,18 @@ This repository provides a small Tkinter + Selenium utility that can automate do
 - Python 3.9+
 - Firefox browser
 - Matching WebDriver binary on your system `PATH` (`geckodriver` for Firefox)
-- Python dependencies: `selenium`, `PyPDF2`
+- Python dependencies: `selenium`, `PyPDF2`, `pdfminer.six`
 
 Install dependencies with:
 
 ```bash
-pip install selenium PyPDF2
+pip install -r requirements.txt
 ```
+
+`pdfminer.six` is now used for significantly cleaner text extraction when building
+`combined_references.txt`. The tool automatically falls back to the legacy
+PyPDF2-based extractor if pdfminer is unavailable, but the new dependency is
+strongly recommended.
 
 ## Usage
 
