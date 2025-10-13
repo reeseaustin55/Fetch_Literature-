@@ -7,10 +7,11 @@ import shutil
 import tempfile
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Tuple
 
 import re
 import unicodedata
@@ -48,6 +49,16 @@ if pypdf2_spec is not None:
 else:  # pragma: no cover - executed only when PyPDF2 is unavailable
     PdfMerger = None  # type: ignore
     PdfReader = None  # type: ignore
+
+
+pdfminer_spec = importlib.util.find_spec("pdfminer.high_level")
+if pdfminer_spec is not None:
+    from pdfminer.high_level import extract_pages  # type: ignore
+    from pdfminer.layout import LAParams, LTTextContainer  # type: ignore
+else:  # pragma: no cover - executed only when pdfminer.six is unavailable
+    extract_pages = None  # type: ignore
+    LAParams = None  # type: ignore
+    LTTextContainer = None  # type: ignore
 
 
 REFERENCE_LEAD_PATTERN = re.compile(r"^\s*(?:\[\d+\]|\(\d+\)|\d+[.)])\s*")
@@ -96,7 +107,18 @@ HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 
 
 PDF_MERGER_AVAILABLE = PdfMerger is not None
-PDF_TEXT_EXTRACTION_AVAILABLE = PdfReader is not None
+PDFMINER_TEXT_AVAILABLE = extract_pages is not None
+PDF_TEXT_EXTRACTION_AVAILABLE = PDFMINER_TEXT_AVAILABLE or PdfReader is not None
+
+FIGURE_CAPTION_PATTERN = re.compile(
+    r"^(?:figure|fig\.|supplementary figure)\b", re.IGNORECASE
+)
+REFERENCE_HEADING_PATTERN = re.compile(
+    r"^(?:references|bibliography|works cited)\s*$", re.IGNORECASE
+)
+HEADER_FOOTER_SHORT_PATTERN = re.compile(
+    r"^(?:\d+|page\s+\d+(?:\s+of\s+\d+)?)$", re.IGNORECASE
+)
 
 
 def page_requires_verification(page_source: str, current_url: str = "") -> bool:
@@ -446,8 +468,12 @@ def export_pdf_texts(
     if not valid_entries:
         return None, None
 
+    advisory: Optional[str] = None
+    if not PDFMINER_TEXT_AVAILABLE and PdfReader is not None:
+        advisory = "Install pdfminer.six for higher fidelity text extraction."
+
     if not PDF_TEXT_EXTRACTION_AVAILABLE:
-        return None, "Install PyPDF2 to export combined PDF text."
+        return None, "Install pdfminer.six or PyPDF2 to export combined PDF text."
 
     try:
         destination_dir.mkdir(parents=True, exist_ok=True)
@@ -460,18 +486,244 @@ def export_pdf_texts(
     for path, name in valid_entries:
         lines.append(f"START OF NEXT STUDY: {name}")
         try:
-            reader = PdfReader(str(path))  # type: ignore[call-arg]
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                if page_text:
-                    lines.append(page_text)
+            extracted = _extract_pdf_text(path)
+            if extracted:
+                lines.append(extracted)
+            else:
+                lines.append("[No extractable text detected.]")
         except Exception as exc:
             lines.append(f"[Text extraction failed for {path.name}: {exc}]")
         lines.append("")
 
     text_content = "\n".join(lines).strip() + "\n"
     text_path.write_text(text_content, encoding="utf-8")
-    return text_path, None
+    return text_path, advisory
+
+
+@dataclass
+class _TextFragment:
+    page: int
+    x0: float
+    y0: float
+    y1: float
+    text: str
+
+
+def _iter_text_containers(layout_obj: Any) -> Iterable[Any]:
+    if LTTextContainer is not None and isinstance(layout_obj, LTTextContainer):
+        yield layout_obj
+    children = getattr(layout_obj, "_objs", None)
+    if not children:
+        return
+    for child in children:
+        yield from _iter_text_containers(child)
+
+
+def _normalize_spaces(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip())
+
+
+def _should_join_without_space(segment: str) -> bool:
+    return bool(segment and segment[0] in ",.;:!?)]}%")
+
+
+def _looks_like_header_footer(line: str, occurrence: int) -> bool:
+    if occurrence <= 1:
+        return False
+    if HEADER_FOOTER_SHORT_PATTERN.match(line):
+        return True
+    lower = line.lower()
+    if "copyright" in lower or "all rights reserved" in lower:
+        return True
+    if lower.startswith("preprint") or lower.startswith("accepted manuscript"):
+        return True
+    alpha_chars = sum(1 for ch in line if ch.isalpha())
+    if alpha_chars:
+        uppercase_ratio = sum(1 for ch in line if ch.isupper()) / alpha_chars
+        if uppercase_ratio > 0.75 and len(line.split()) <= 6:
+            return True
+    return False
+
+
+def _looks_like_reference_start(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped:
+        return False
+    token = stripped.split(maxsplit=1)[0]
+    token_core = token.strip("[]().")
+    if token_core.isdigit():
+        return True
+    if len(token_core) > 1 and token_core[:-1].isdigit() and token_core[-1].isalpha():
+        return True
+    token_numeric = token.rstrip(").,")
+    if token_numeric.isdigit():
+        return True
+    if "," in stripped and re.search(r"(19|20)\d{2}", stripped):
+        first_segment = stripped.split(",", 1)[0]
+        if len(first_segment.split()) <= 8:
+            return True
+    return False
+
+
+def _postprocess_extracted_lines(raw_lines: List[str]) -> List[str]:
+    if not raw_lines:
+        return []
+    while raw_lines and not raw_lines[-1]:
+        raw_lines.pop()
+
+    counts = Counter(line for line in raw_lines if line)
+
+    filtered: List[str] = []
+    for line in raw_lines:
+        if not line:
+            if filtered and filtered[-1] != "":
+                filtered.append("")
+            continue
+        if _looks_like_header_footer(line, counts[line]):
+            continue
+        filtered.append(line)
+
+    paragraphs: List[str] = []
+    current = ""
+    in_references = False
+
+    for line in filtered:
+        if not line:
+            if current:
+                paragraphs.append(_normalize_spaces(current))
+                current = ""
+            continue
+
+        if REFERENCE_HEADING_PATTERN.match(line):
+            if current:
+                paragraphs.append(_normalize_spaces(current))
+                current = ""
+            paragraphs.append(_normalize_spaces(line))
+            in_references = True
+            continue
+
+        if FIGURE_CAPTION_PATTERN.match(line):
+            if current:
+                paragraphs.append(_normalize_spaces(current))
+                current = ""
+            paragraphs.append(_normalize_spaces(line))
+            continue
+
+        if in_references and _looks_like_reference_start(line):
+            if current:
+                paragraphs.append(_normalize_spaces(current))
+            current = line
+            continue
+
+        if not current:
+            current = line
+            continue
+
+        if current.endswith("-") and not current.endswith("--"):
+            current = current[:-1] + line
+        elif _should_join_without_space(line):
+            current += line
+        else:
+            current += " " + line
+
+    if current:
+        paragraphs.append(_normalize_spaces(current))
+
+    cleaned: List[str] = []
+    for entry in paragraphs:
+        normalized = _normalize_spaces(entry)
+        if not normalized:
+            continue
+        if cleaned and cleaned[-1] == normalized:
+            continue
+        cleaned.append(normalized)
+
+    return cleaned
+
+
+def _extract_text_with_pdfminer(path: Path) -> List[str]:
+    if not PDFMINER_TEXT_AVAILABLE or extract_pages is None:
+        return []
+
+    laparams = LAParams(
+        char_margin=2.0,
+        line_margin=0.6,
+        word_margin=0.2,
+        boxes_flow=None,
+        detect_vertical=False,
+        all_texts=True,
+    )
+
+    fragments: List[_TextFragment] = []
+    try:
+        for page_number, layout in enumerate(extract_pages(str(path), laparams=laparams)):
+            for container in _iter_text_containers(layout):
+                text = getattr(container, "get_text", lambda: "")()
+                if not text:
+                    continue
+                fragments.append(
+                    _TextFragment(
+                        page=page_number,
+                        x0=getattr(container, "x0", 0.0),
+                        y0=getattr(container, "y0", 0.0),
+                        y1=getattr(container, "y1", 0.0),
+                        text=text.replace("\r", "\n"),
+                    )
+                )
+    except Exception:
+        return []
+
+    fragments.sort(key=lambda frag: (frag.page, -frag.y1, frag.x0))
+
+    raw_lines: List[str] = []
+    for fragment in fragments:
+        block_lines = [
+            _normalize_spaces(line)
+            for line in fragment.text.splitlines()
+        ]
+        meaningful = [line for line in block_lines if line]
+        if not meaningful:
+            continue
+        raw_lines.extend(meaningful)
+        raw_lines.append("")
+
+    return _postprocess_extracted_lines(raw_lines)
+
+
+def _extract_text_with_pypdf2(path: Path) -> List[str]:
+    if PdfReader is None:
+        return []
+
+    try:
+        reader = PdfReader(str(path))  # type: ignore[call-arg]
+    except Exception:
+        return []
+
+    raw_lines: List[str] = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        if not text:
+            continue
+        block_lines = [
+            _normalize_spaces(line)
+            for line in text.replace("\r", "\n").splitlines()
+        ]
+        meaningful = [line for line in block_lines if line]
+        if not meaningful:
+            continue
+        raw_lines.extend(meaningful)
+        raw_lines.append("")
+
+    return _postprocess_extracted_lines(raw_lines)
+
+
+def _extract_pdf_text(path: Path) -> str:
+    paragraphs = _extract_text_with_pdfminer(path)
+    if not paragraphs:
+        paragraphs = _extract_text_with_pypdf2(path)
+    if not paragraphs:
+        return ""
+    return "\n\n".join(paragraphs)
 
 
 def get_default_download_dir() -> Path:
