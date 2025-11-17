@@ -22,6 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 
 import importlib.util
+from urllib.error import HTTPError
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
@@ -904,6 +905,13 @@ def fetch_scholar_prompt_results(
         request = Request(query_url, headers={"User-Agent": SCHOLAR_USER_AGENT})
         with urlopen(request, timeout=timeout) as response:
             html_text = response.read().decode("utf-8", errors="ignore")
+    except HTTPError as exc:
+        if exc.code == 429:
+            return [], (
+                "Google Scholar is rate limiting requests (HTTP 429: Too Many "
+                "Requests). Please wait a few minutes and try again."
+            )
+        return [], f"Could not reach Google Scholar (HTTP {exc.code})"
     except Exception as exc:
         return [], f"Could not reach Google Scholar ({exc})"
 
@@ -1455,7 +1463,7 @@ class App(tk.Tk):
                 self.search_query_var.get(), max_results=20
             )
             if error:
-                messagebox.showwarning("No search results", error)
+                messagebox.showwarning("Google Scholar search", error)
                 return
         else:
             references = extract_references(self.text_box.get("1.0", tk.END))
