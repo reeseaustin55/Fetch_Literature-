@@ -854,6 +854,69 @@ def resolve_manual_targets(reference: str, timeout: float = 10.0) -> ManualTarge
     return ManualTargets(query_url, article_url, pdf_url, title)
 
 
+def _clean_scholar_title(fragment: str) -> str:
+    text = unescape(fragment)
+    text = HTML_TAG_PATTERN.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    while True:
+        cleaned = re.sub(r"^\[[^\]]+\]\s*", "", text).strip()
+        if cleaned == text:
+            break
+        text = cleaned
+    return text
+
+
+def _parse_scholar_titles(html: str, max_results: int = 20) -> List[str]:
+    titles: List[str] = []
+    seen: set[str] = set()
+    for match in SCHOLAR_TITLE_HTML_PATTERN.finditer(html):
+        cleaned = _clean_scholar_title(match.group(1))
+        normalized = cleaned.lower()
+        if cleaned and normalized not in seen:
+            titles.append(cleaned)
+            seen.add(normalized)
+        if len(titles) >= max_results:
+            break
+    return titles
+
+
+def fetch_scholar_prompt_results(
+    prompt: str, max_results: int = 20, timeout: float = 10.0
+) -> tuple[List[str], Optional[str]]:
+    """Return the first Google Scholar titles for a free-form prompt.
+
+    The function caps ``max_results`` at 20 (the most Google Scholar exposes on a
+    single page) and returns a tuple of ``(titles, error_message)``. When Scholar
+    requires verification or the request fails, ``titles`` will be empty and the
+    ``error_message`` will describe the issue.
+    """
+
+    trimmed = prompt.strip()
+    if not trimmed:
+        return [], "Please enter a search prompt."
+
+    capped_results = max(1, min(max_results, 20))
+    query_url = (
+        f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q={quote_plus(trimmed)}&num={capped_results}"
+    )
+
+    try:
+        request = Request(query_url, headers={"User-Agent": SCHOLAR_USER_AGENT})
+        with urlopen(request, timeout=timeout) as response:
+            html_text = response.read().decode("utf-8", errors="ignore")
+    except Exception as exc:
+        return [], f"Could not reach Google Scholar ({exc})"
+
+    if page_requires_verification(html_text, query_url):
+        return [], "Google Scholar requires verification before showing the results."
+
+    titles = _parse_scholar_titles(html_text, max_results=capped_results)
+    if not titles:
+        return [], "No titles were found on the Google Scholar results page."
+
+    return titles, None
+
+
 class SkipRequested(Exception):
     """Raised when the user requests to skip the current download."""
 
@@ -1257,22 +1320,52 @@ class App(tk.Tk):
         self.manual_auto_var = tk.BooleanVar(value=True)
         self._manual_prompt_acknowledged = False
         self._current_browser_label = "Firefox"
+        self.mode_var = tk.StringVar(value="bibliography")
+        self.search_query_var = tk.StringVar()
         self._build_ui()
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(3, weight=1)
 
-        instruction = tk.Label(
+        mode_frame = tk.Frame(self)
+        mode_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
+        mode_frame.columnconfigure(2, weight=1)
+
+        tk.Label(mode_frame, text="Input mode:").grid(row=0, column=0, sticky="w")
+        tk.Radiobutton(
+            mode_frame,
+            text="Bibliography entries",
+            value="bibliography",
+            variable=self.mode_var,
+            command=self._on_mode_change,
+        ).grid(row=0, column=1, sticky="w", padx=(5, 15))
+        tk.Radiobutton(
+            mode_frame,
+            text="Google Scholar search prompt",
+            value="search",
+            variable=self.mode_var,
+            command=self._on_mode_change,
+        ).grid(row=0, column=2, sticky="w")
+
+        self.instruction_label = tk.Label(
             self, text="Paste your bibliography entries below (one per line):"
         )
-        instruction.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 0))
+        self.instruction_label.grid(row=1, column=0, sticky="w", padx=10, pady=(10, 0))
+
+        search_frame = tk.Frame(self)
+        search_frame.grid(row=2, column=0, sticky="ew", padx=10)
+        search_frame.columnconfigure(1, weight=1)
+        tk.Label(search_frame, text="Search prompt:").grid(row=0, column=0, sticky="w")
+        self.search_entry = tk.Entry(search_frame, textvariable=self.search_query_var)
+        self.search_entry.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        self.search_entry.config(state=tk.DISABLED)
 
         self.text_box = scrolledtext.ScrolledText(self, wrap=tk.WORD)
-        self.text_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        self.text_box.grid(row=3, column=0, sticky="nsew", padx=10, pady=10)
 
         path_frame = tk.Frame(self)
-        path_frame.grid(row=2, column=0, sticky="ew", padx=10)
+        path_frame.grid(row=4, column=0, sticky="ew", padx=10)
         path_frame.columnconfigure(1, weight=1)
 
         tk.Label(path_frame, text="Destination folder:").grid(row=0, column=0, sticky="w")
@@ -1310,7 +1403,7 @@ class App(tk.Tk):
         auto_manual_check.grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 5))
 
         controls_frame = tk.Frame(self)
-        controls_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(5, 10))
+        controls_frame.grid(row=5, column=0, sticky="ew", padx=10, pady=(5, 10))
         controls_frame.columnconfigure(0, weight=1)
 
         self.status_var = tk.StringVar(value="Idle")
@@ -1330,6 +1423,21 @@ class App(tk.Tk):
         )
         self.skip_button.grid(row=0, column=2, padx=(10, 0))
 
+    def _on_mode_change(self) -> None:
+        mode = self.mode_var.get()
+        if mode == "search":
+            self.instruction_label.config(
+                text="Enter a Google Scholar search prompt to pull the first 20 results:"
+            )
+            self.search_entry.config(state=tk.NORMAL)
+            self.text_box.config(state=tk.DISABLED)
+        else:
+            self.instruction_label.config(
+                text="Paste your bibliography entries below (one per line):"
+            )
+            self.search_entry.config(state=tk.DISABLED)
+            self.text_box.config(state=tk.NORMAL)
+
     def _choose_folder(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.path_var.get())
         if selected:
@@ -1342,12 +1450,21 @@ class App(tk.Tk):
             )
             return
 
-        references = extract_references(self.text_box.get("1.0", tk.END))
-        if not references:
-            messagebox.showwarning(
-                "No references", "No bibliography entries were detected in the provided text."
+        if self.mode_var.get() == "search":
+            references, error = fetch_scholar_prompt_results(
+                self.search_query_var.get(), max_results=20
             )
-            return
+            if error:
+                messagebox.showwarning("No search results", error)
+                return
+        else:
+            references = extract_references(self.text_box.get("1.0", tk.END))
+            if not references:
+                messagebox.showwarning(
+                    "No references",
+                    "No bibliography entries were detected in the provided text.",
+                )
+                return
 
         destination = Path(self.path_var.get()).expanduser()
         try:
