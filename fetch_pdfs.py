@@ -881,6 +881,21 @@ def _parse_scholar_titles(html: str, max_results: int = 20) -> List[str]:
     return titles
 
 
+def _fetch_scholar_results_html(query_url: str, timeout: float) -> tuple[str, Optional[str]]:
+    try:
+        request = Request(query_url, headers={"User-Agent": SCHOLAR_USER_AGENT})
+        with urlopen(request, timeout=timeout) as response:
+            html_text = response.read().decode("utf-8", errors="ignore")
+    except HTTPError as exc:
+        if exc.code == 429:
+            return "", "rate_limit"
+        return "", f"Could not reach Google Scholar (HTTP {exc.code})"
+    except Exception as exc:
+        return "", f"Could not reach Google Scholar ({exc})"
+
+    return html_text, None
+
+
 def fetch_scholar_prompt_results(
     prompt: str, max_results: int = 20, timeout: float = 10.0
 ) -> tuple[List[str], Optional[str]]:
@@ -901,19 +916,22 @@ def fetch_scholar_prompt_results(
         f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q={quote_plus(trimmed)}&num={capped_results}"
     )
 
-    try:
-        request = Request(query_url, headers={"User-Agent": SCHOLAR_USER_AGENT})
-        with urlopen(request, timeout=timeout) as response:
-            html_text = response.read().decode("utf-8", errors="ignore")
-    except HTTPError as exc:
-        if exc.code == 429:
+    html_text, error = _fetch_scholar_results_html(query_url, timeout)
+    if error == "rate_limit":
+        # Scholar occasionally throttles the initial request. Try again with a brief pause
+        # and a smaller result set to reduce the likelihood of triggering rate limits,
+        # then proceed with the stored titles for the rest of the workflow.
+        time.sleep(5)
+        retry_url = f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q={quote_plus(trimmed)}&num={min(capped_results, 10)}"
+        html_text, error = _fetch_scholar_results_html(retry_url, timeout)
+        if error == "rate_limit":
             return [], (
                 "Google Scholar is rate limiting requests (HTTP 429: Too Many "
-                "Requests). Please wait a few minutes and try again."
+                "Requests). A retry was attempted automatically; please wait a "
+                "few minutes before trying again."
             )
-        return [], f"Could not reach Google Scholar (HTTP {exc.code})"
-    except Exception as exc:
-        return [], f"Could not reach Google Scholar ({exc})"
+    if error:
+        return [], error
 
     if page_requires_verification(html_text, query_url):
         return [], "Google Scholar requires verification before showing the results."
