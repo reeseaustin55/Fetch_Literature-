@@ -47,7 +47,9 @@ strongly recommended.
      for a new PDF for up to 60 seconds per reference. As soon as a file appears
      there, it is moved into the chosen destination and renamed to match the
      title reported by Google Scholar for that result. The confirmation instructions only appear the first time
-     manual fallback runs during a session.
+     manual fallback runs during a session. Automatic prompts now skip author profile
+     pages when preloading the first Scholar result so the opened links focus on
+     actual articles.
    - With the **Try to auto-open the first PDF when manual fallback runs**
      checkbox (enabled by default), the tool fetches the first Google Scholar
      result in the background and attempts to open the associated PDF and

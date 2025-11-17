@@ -813,11 +813,25 @@ def _parse_manual_targets(
     if pdf_match:
         pdf_url = _make_absolute_url(unescape(pdf_match.group(1).strip()), base)
 
-    article_match = SCHOLAR_ARTICLE_LINK_PATTERN.search(html)
-    if article_match:
-        article_url = _make_absolute_url(unescape(article_match.group(1).strip()), base)
+    title_match: Optional[re.Match[str]] = None
 
-    title_match = SCHOLAR_TITLE_HTML_PATTERN.search(html)
+    def is_author_profile(url: str) -> bool:
+        normalized = url.lower()
+        return "/citations?" in normalized or normalized.endswith("/citations")
+
+    for article_match in SCHOLAR_ARTICLE_LINK_PATTERN.finditer(html):
+        candidate_url = _make_absolute_url(
+            unescape(article_match.group(1).strip()), base
+        )
+        if is_author_profile(candidate_url):
+            continue
+        article_url = candidate_url
+        title_match = article_match
+        break
+
+    if title_match is None:
+        title_match = SCHOLAR_TITLE_HTML_PATTERN.search(html)
+
     if title_match:
         fragment = unescape(title_match.group(1))
         fragment = HTML_TAG_PATTERN.sub(" ", fragment)
