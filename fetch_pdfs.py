@@ -22,6 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 
 import importlib.util
+from urllib.error import HTTPError
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
@@ -83,6 +84,9 @@ CHALLENGE_KEYWORDS = (
 
 
 SCHOLAR_BASE_URL = "https://scholar.google.com"
+OFF_CAMPUS_PROXY_SCRIPT = (
+    "javascript:void(location.href=\"http://proxy.library.cornell.edu/login?url=\"+location.href);"
+)
 
 SCHOLAR_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -812,11 +816,25 @@ def _parse_manual_targets(
     if pdf_match:
         pdf_url = _make_absolute_url(unescape(pdf_match.group(1).strip()), base)
 
-    article_match = SCHOLAR_ARTICLE_LINK_PATTERN.search(html)
-    if article_match:
-        article_url = _make_absolute_url(unescape(article_match.group(1).strip()), base)
+    title_match: Optional[re.Match[str]] = None
 
-    title_match = SCHOLAR_TITLE_HTML_PATTERN.search(html)
+    def is_author_profile(url: str) -> bool:
+        normalized = url.lower()
+        return "/citations?" in normalized or normalized.endswith("/citations")
+
+    for article_match in SCHOLAR_ARTICLE_LINK_PATTERN.finditer(html):
+        candidate_url = _make_absolute_url(
+            unescape(article_match.group(1).strip()), base
+        )
+        if is_author_profile(candidate_url):
+            continue
+        article_url = candidate_url
+        title_match = article_match
+        break
+
+    if title_match is None:
+        title_match = SCHOLAR_TITLE_HTML_PATTERN.search(html)
+
     if title_match:
         fragment = unescape(title_match.group(1))
         fragment = HTML_TAG_PATTERN.sub(" ", fragment)
@@ -854,6 +872,110 @@ def resolve_manual_targets(reference: str, timeout: float = 10.0) -> ManualTarge
     return ManualTargets(query_url, article_url, pdf_url, title)
 
 
+def _clean_scholar_title(fragment: str) -> str:
+    text = unescape(fragment)
+    text = HTML_TAG_PATTERN.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    while True:
+        cleaned = re.sub(r"^\[[^\]]+\]\s*", "", text).strip()
+        if cleaned == text:
+            break
+        text = cleaned
+    return text
+
+
+def _parse_scholar_titles(html: str, max_results: int = 20) -> List[str]:
+    titles: List[str] = []
+    seen: set[str] = set()
+    for match in SCHOLAR_TITLE_HTML_PATTERN.finditer(html):
+        cleaned = _clean_scholar_title(match.group(1))
+        normalized = cleaned.lower()
+        if cleaned and normalized not in seen:
+            titles.append(cleaned)
+            seen.add(normalized)
+        if len(titles) >= max_results:
+            break
+    return titles
+
+
+def _fetch_scholar_results_html(query_url: str, timeout: float) -> tuple[str, Optional[str]]:
+    try:
+        request = Request(query_url, headers={"User-Agent": SCHOLAR_USER_AGENT})
+        with urlopen(request, timeout=timeout) as response:
+            html_text = response.read().decode("utf-8", errors="ignore")
+    except HTTPError as exc:
+        if exc.code == 429:
+            return "", "rate_limit"
+        return "", f"Could not reach Google Scholar (HTTP {exc.code})"
+    except Exception as exc:
+        return "", f"Could not reach Google Scholar ({exc})"
+
+    return html_text, None
+
+
+def fetch_scholar_prompt_results(
+    prompt: str, max_results: int = 20, timeout: float = 10.0
+) -> tuple[List[str], Optional[str]]:
+    """Return the first Google Scholar titles for a free-form prompt.
+
+    The function returns a tuple of ``(titles, error_message)``. When Scholar
+    requires verification or the request fails, ``titles`` will be empty and the
+    ``error_message`` will describe the issue.
+    """
+
+    trimmed = prompt.strip()
+    if not trimmed:
+        return [], "Please enter a search prompt."
+
+    total_requested = max(1, max_results)
+    titles: List[str] = []
+    start_index = 0
+
+    while len(titles) < total_requested:
+        remaining = total_requested - len(titles)
+        batch_size = min(remaining, 20)
+        query_url = (
+            f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q="
+            f"{quote_plus(trimmed)}&num={batch_size}&start={start_index}"
+        )
+
+        html_text, error = _fetch_scholar_results_html(query_url, timeout)
+        if error == "rate_limit":
+            # Scholar occasionally throttles the request. Try again with a brief pause
+            # and a smaller result set to reduce the likelihood of triggering rate limits.
+            time.sleep(5)
+            retry_url = (
+                f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q="
+                f"{quote_plus(trimmed)}&num={min(batch_size, 10)}&start={start_index}"
+            )
+            html_text, error = _fetch_scholar_results_html(retry_url, timeout)
+            if error == "rate_limit":
+                return [], (
+                    "Google Scholar is rate limiting requests (HTTP 429: Too Many "
+                    "Requests). A retry was attempted automatically; please wait a "
+                    "few minutes before trying again."
+                )
+        if error:
+            return [], error
+
+        if page_requires_verification(html_text, query_url):
+            return [], "Google Scholar requires verification before showing the results."
+
+        page_titles = _parse_scholar_titles(html_text, max_results=batch_size)
+        if not page_titles:
+            if not titles:
+                return [], "No titles were found on the Google Scholar results page."
+            break
+
+        titles.extend(page_titles)
+        start_index += batch_size
+
+        if len(page_titles) < batch_size:
+            break
+
+    return titles[:total_requested], None
+
+
 class SkipRequested(Exception):
     """Raised when the user requests to skip the current download."""
 
@@ -868,6 +990,7 @@ class PDFDownloader:
         self,
         download_dir: Path,
         challenge_callback: Optional[Callable[[str], None]] = None,
+        login_callback: Optional[Callable[[str], None]] = None,
         download_timeout: float = 30.0,
     ) -> None:
         if webdriver is None:
@@ -880,6 +1003,7 @@ class PDFDownloader:
         self.driver = self._create_driver(download_dir)
         self.base_handle = self.driver.current_window_handle
         self.challenge_callback = challenge_callback
+        self.login_callback = login_callback
         self.download_timeout = max(1.0, float(download_timeout))
 
     @staticmethod
@@ -951,6 +1075,17 @@ class PDFDownloader:
                 )
             except SkipRequested:
                 return DownloadResult(reference, False, "Skipped by user")
+
+            try:
+                self._apply_cornell_proxy_if_needed(skip_event)
+            except SkipRequested:
+                return DownloadResult(reference, False, "Skipped by user")
+            except TimeoutException:
+                return DownloadResult(
+                    reference,
+                    False,
+                    "Cornell login was not completed in time",
+                )
 
             try:
                 pdf_link = self._wait_for_pdf_link(skip_event)
@@ -1125,6 +1260,77 @@ class PDFDownloader:
             return new_handle, True
         return self.driver.current_window_handle, False
 
+    def _wait_for_page_ready(
+        self, timeout: float = 20.0, skip_event: Optional[threading.Event] = None
+    ) -> None:
+        end = time.time() + max(timeout, 1.0)
+        while time.time() < end:
+            self._check_skip(skip_event)
+            try:
+                state = self.driver.execute_script("return document.readyState")
+                if state == "complete":
+                    return
+            except WebDriverException:
+                pass
+            time.sleep(0.5)
+
+    def _is_cornell_login_page(self) -> bool:
+        try:
+            current_url = self.driver.current_url.lower()
+            source = self.driver.page_source.lower()
+        except WebDriverException:
+            return False
+
+        if "proxy.library.cornell.edu/login" in current_url:
+            return True
+        if "shibidp.cit.cornell.edu" in current_url or "login.cornell.edu" in current_url:
+            return True
+        if "cornell netid" in source or "netid login" in source:
+            return True
+        return False
+
+    def _wait_for_cornell_login(self, skip_event: Optional[threading.Event]) -> None:
+        if not self._is_cornell_login_page():
+            return
+
+        message = (
+            "Cornell's proxy sign-in is required for this source. "
+            "Switch to Firefox, complete the NetID login, then return here."
+        )
+        if self.login_callback is not None:
+            try:
+                self.login_callback(message)
+            except Exception:
+                pass
+
+        deadline = time.time() + self.CHALLENGE_TIMEOUT
+        while time.time() < deadline:
+            self._check_skip(skip_event)
+            if not self._is_cornell_login_page():
+                return
+            time.sleep(1)
+
+        raise TimeoutException("Cornell login was not completed in time")
+
+    def _apply_cornell_proxy_if_needed(
+        self, skip_event: Optional[threading.Event] = None
+    ) -> None:
+        try:
+            current_url = self.driver.current_url
+        except WebDriverException:
+            return
+
+        if "proxy.library.cornell.edu" in current_url:
+            return
+
+        try:
+            self.driver.execute_script(OFF_CAMPUS_PROXY_SCRIPT)
+        except WebDriverException:
+            return
+
+        self._wait_for_page_ready(skip_event=skip_event)
+        self._wait_for_cornell_login(skip_event)
+
     def _wait_for_pdf_link(
         self, skip_event: Optional[threading.Event] = None
     ):
@@ -1257,22 +1463,64 @@ class App(tk.Tk):
         self.manual_auto_var = tk.BooleanVar(value=True)
         self._manual_prompt_acknowledged = False
         self._current_browser_label = "Firefox"
+        self.mode_var = tk.StringVar(value="bibliography")
+        self.search_query_var = tk.StringVar()
+        self.search_results_var = tk.StringVar(value="20")
         self._build_ui()
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(3, weight=1)
 
-        instruction = tk.Label(
+        mode_frame = tk.Frame(self)
+        mode_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
+        mode_frame.columnconfigure(2, weight=1)
+
+        tk.Label(mode_frame, text="Input mode:").grid(row=0, column=0, sticky="w")
+        tk.Radiobutton(
+            mode_frame,
+            text="Bibliography entries",
+            value="bibliography",
+            variable=self.mode_var,
+            command=self._on_mode_change,
+        ).grid(row=0, column=1, sticky="w", padx=(5, 15))
+        tk.Radiobutton(
+            mode_frame,
+            text="Google Scholar search prompt",
+            value="search",
+            variable=self.mode_var,
+            command=self._on_mode_change,
+        ).grid(row=0, column=2, sticky="w")
+
+        self.instruction_label = tk.Label(
             self, text="Paste your bibliography entries below (one per line):"
         )
-        instruction.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 0))
+        self.instruction_label.grid(row=1, column=0, sticky="w", padx=10, pady=(10, 0))
+
+        search_frame = tk.Frame(self)
+        search_frame.grid(row=2, column=0, sticky="ew", padx=10)
+        search_frame.columnconfigure(1, weight=1)
+        tk.Label(search_frame, text="Search prompt:").grid(row=0, column=0, sticky="w")
+        self.search_entry = tk.Entry(search_frame, textvariable=self.search_query_var)
+        self.search_entry.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        self.search_entry.config(state=tk.DISABLED)
+
+        tk.Label(search_frame, text="Number of results:").grid(
+            row=1, column=0, sticky="w", pady=(5, 0)
+        )
+        self.search_results_entry = tk.Entry(
+            search_frame,
+            width=10,
+            textvariable=self.search_results_var,
+            state=tk.DISABLED,
+        )
+        self.search_results_entry.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(5, 0))
 
         self.text_box = scrolledtext.ScrolledText(self, wrap=tk.WORD)
-        self.text_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        self.text_box.grid(row=3, column=0, sticky="nsew", padx=10, pady=10)
 
         path_frame = tk.Frame(self)
-        path_frame.grid(row=2, column=0, sticky="ew", padx=10)
+        path_frame.grid(row=4, column=0, sticky="ew", padx=10)
         path_frame.columnconfigure(1, weight=1)
 
         tk.Label(path_frame, text="Destination folder:").grid(row=0, column=0, sticky="w")
@@ -1310,7 +1558,7 @@ class App(tk.Tk):
         auto_manual_check.grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 5))
 
         controls_frame = tk.Frame(self)
-        controls_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(5, 10))
+        controls_frame.grid(row=5, column=0, sticky="ew", padx=10, pady=(5, 10))
         controls_frame.columnconfigure(0, weight=1)
 
         self.status_var = tk.StringVar(value="Idle")
@@ -1330,6 +1578,26 @@ class App(tk.Tk):
         )
         self.skip_button.grid(row=0, column=2, padx=(10, 0))
 
+    def _on_mode_change(self) -> None:
+        mode = self.mode_var.get()
+        if mode == "search":
+            self.instruction_label.config(
+                text=(
+                    "Enter a Google Scholar search prompt to pull the first results "
+                    "(you choose how many):"
+                )
+            )
+            self.search_entry.config(state=tk.NORMAL)
+            self.search_results_entry.config(state=tk.NORMAL)
+            self.text_box.config(state=tk.DISABLED)
+        else:
+            self.instruction_label.config(
+                text="Paste your bibliography entries below (one per line):"
+            )
+            self.search_entry.config(state=tk.DISABLED)
+            self.search_results_entry.config(state=tk.DISABLED)
+            self.text_box.config(state=tk.NORMAL)
+
     def _choose_folder(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.path_var.get())
         if selected:
@@ -1342,12 +1610,37 @@ class App(tk.Tk):
             )
             return
 
-        references = extract_references(self.text_box.get("1.0", tk.END))
-        if not references:
-            messagebox.showwarning(
-                "No references", "No bibliography entries were detected in the provided text."
+        if self.mode_var.get() == "search":
+            try:
+                requested_results = int(self.search_results_var.get())
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid number of results",
+                    "Please enter how many Google Scholar results to use (1 or more).",
+                )
+                return
+
+            if requested_results <= 0:
+                messagebox.showerror(
+                    "Invalid number of results",
+                    "Please choose at least one Google Scholar result to use.",
+                )
+                return
+
+            references, error = fetch_scholar_prompt_results(
+                self.search_query_var.get(), max_results=requested_results
             )
-            return
+            if error:
+                messagebox.showwarning("Google Scholar search", error)
+                return
+        else:
+            references = extract_references(self.text_box.get("1.0", tk.END))
+            if not references:
+                messagebox.showwarning(
+                    "No references",
+                    "No bibliography entries were detected in the provided text.",
+                )
+                return
 
         destination = Path(self.path_var.get()).expanduser()
         try:
@@ -1419,6 +1712,7 @@ class App(tk.Tk):
             self.downloader = PDFDownloader(
                 temp_dir,
                 self._prompt_challenge,
+                login_callback=self._prompt_cornell_login,
                 download_timeout=timeout_seconds,
             )
             total_tasks = len(references)
@@ -1848,6 +2142,20 @@ class App(tk.Tk):
                 f"Waiting for manual verification in {browser_label} (complete the challenge and click OK)..."
             )
             messagebox.showinfo("Manual verification required", message)
+            event.set()
+
+        self.after(0, show_message)
+        event.wait()
+        self._update_status("Resuming downloads...")
+
+    def _prompt_cornell_login(self, message: str) -> None:
+        event = threading.Event()
+
+        def show_message() -> None:
+            self.status_var.set(
+                "Waiting for Cornell proxy login (complete sign-in and click OK)..."
+            )
+            messagebox.showinfo("Cornell login required", message)
             event.set()
 
         self.after(0, show_message)
