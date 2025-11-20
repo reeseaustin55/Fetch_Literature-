@@ -63,5 +63,6 @@ strongly recommended.
      with `START OF NEXT STUDY:` followed by the detected study title.
 
 If you need to access paywalled articles from off-campus using Cornell University’s library services, click the **Cornell off-campus access instructions** button in the app to open the official guide: <https://www-library-cornell-edu.proxy.library.cornell.edu/collections/off-campus-access/>.
+When the downloader opens an article page that requires Cornell’s proxy, it automatically triggers the Cornell off-campus bookmarklet, waits for you to finish logging in, and then continues hunting for the PDF.
 
 Downloads occur through Firefox so they retain any session-based access you have in that profile (provided the matching WebDriver reuses it).

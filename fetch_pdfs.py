@@ -87,6 +87,9 @@ SCHOLAR_BASE_URL = "https://scholar.google.com"
 OFF_CAMPUS_HELP_URL = (
     "https://www-library-cornell-edu.proxy.library.cornell.edu/collections/off-campus-access/"
 )
+OFF_CAMPUS_PROXY_SCRIPT = (
+    "javascript:void(location.href=\"http://proxy.library.cornell.edu/login?url=\"+location.href);"
+)
 
 SCHOLAR_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -974,6 +977,7 @@ class PDFDownloader:
         self,
         download_dir: Path,
         challenge_callback: Optional[Callable[[str], None]] = None,
+        login_callback: Optional[Callable[[str], None]] = None,
         download_timeout: float = 30.0,
     ) -> None:
         if webdriver is None:
@@ -986,6 +990,7 @@ class PDFDownloader:
         self.driver = self._create_driver(download_dir)
         self.base_handle = self.driver.current_window_handle
         self.challenge_callback = challenge_callback
+        self.login_callback = login_callback
         self.download_timeout = max(1.0, float(download_timeout))
 
     @staticmethod
@@ -1057,6 +1062,17 @@ class PDFDownloader:
                 )
             except SkipRequested:
                 return DownloadResult(reference, False, "Skipped by user")
+
+            try:
+                self._apply_cornell_proxy_if_needed(skip_event)
+            except SkipRequested:
+                return DownloadResult(reference, False, "Skipped by user")
+            except TimeoutException:
+                return DownloadResult(
+                    reference,
+                    False,
+                    "Cornell login was not completed in time",
+                )
 
             try:
                 pdf_link = self._wait_for_pdf_link(skip_event)
@@ -1230,6 +1246,77 @@ class PDFDownloader:
             self.driver.switch_to.window(new_handle)
             return new_handle, True
         return self.driver.current_window_handle, False
+
+    def _wait_for_page_ready(
+        self, timeout: float = 20.0, skip_event: Optional[threading.Event] = None
+    ) -> None:
+        end = time.time() + max(timeout, 1.0)
+        while time.time() < end:
+            self._check_skip(skip_event)
+            try:
+                state = self.driver.execute_script("return document.readyState")
+                if state == "complete":
+                    return
+            except WebDriverException:
+                pass
+            time.sleep(0.5)
+
+    def _is_cornell_login_page(self) -> bool:
+        try:
+            current_url = self.driver.current_url.lower()
+            source = self.driver.page_source.lower()
+        except WebDriverException:
+            return False
+
+        if "proxy.library.cornell.edu/login" in current_url:
+            return True
+        if "shibidp.cit.cornell.edu" in current_url or "login.cornell.edu" in current_url:
+            return True
+        if "cornell netid" in source or "netid login" in source:
+            return True
+        return False
+
+    def _wait_for_cornell_login(self, skip_event: Optional[threading.Event]) -> None:
+        if not self._is_cornell_login_page():
+            return
+
+        message = (
+            "Cornell's proxy sign-in is required for this source. "
+            "Switch to Firefox, complete the NetID login, then return here."
+        )
+        if self.login_callback is not None:
+            try:
+                self.login_callback(message)
+            except Exception:
+                pass
+
+        deadline = time.time() + self.CHALLENGE_TIMEOUT
+        while time.time() < deadline:
+            self._check_skip(skip_event)
+            if not self._is_cornell_login_page():
+                return
+            time.sleep(1)
+
+        raise TimeoutException("Cornell login was not completed in time")
+
+    def _apply_cornell_proxy_if_needed(
+        self, skip_event: Optional[threading.Event] = None
+    ) -> None:
+        try:
+            current_url = self.driver.current_url
+        except WebDriverException:
+            return
+
+        if "proxy.library.cornell.edu" in current_url:
+            return
+
+        try:
+            self.driver.execute_script(OFF_CAMPUS_PROXY_SCRIPT)
+        except WebDriverException:
+            return
+
+        self._wait_for_page_ready(skip_event=skip_event)
+        self._wait_for_cornell_login(skip_event)
 
     def _wait_for_pdf_link(
         self, skip_event: Optional[threading.Event] = None
@@ -1640,6 +1727,7 @@ class App(tk.Tk):
             self.downloader = PDFDownloader(
                 temp_dir,
                 self._prompt_challenge,
+                login_callback=self._prompt_cornell_login,
                 download_timeout=timeout_seconds,
             )
             total_tasks = len(references)
@@ -2069,6 +2157,20 @@ class App(tk.Tk):
                 f"Waiting for manual verification in {browser_label} (complete the challenge and click OK)..."
             )
             messagebox.showinfo("Manual verification required", message)
+            event.set()
+
+        self.after(0, show_message)
+        event.wait()
+        self._update_status("Resuming downloads...")
+
+    def _prompt_cornell_login(self, message: str) -> None:
+        event = threading.Event()
+
+        def show_message() -> None:
+            self.status_var.set(
+                "Waiting for Cornell proxy login (complete sign-in and click OK)..."
+            )
+            messagebox.showinfo("Cornell login required", message)
             event.set()
 
         self.after(0, show_message)
