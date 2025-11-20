@@ -84,9 +84,6 @@ CHALLENGE_KEYWORDS = (
 
 
 SCHOLAR_BASE_URL = "https://scholar.google.com"
-OFF_CAMPUS_HELP_URL = (
-    "https://www-library-cornell-edu.proxy.library.cornell.edu/collections/off-campus-access/"
-)
 OFF_CAMPUS_PROXY_SCRIPT = (
     "javascript:void(location.href=\"http://proxy.library.cornell.edu/login?url=\"+location.href);"
 )
@@ -921,8 +918,7 @@ def fetch_scholar_prompt_results(
 ) -> tuple[List[str], Optional[str]]:
     """Return the first Google Scholar titles for a free-form prompt.
 
-    The function caps ``max_results`` at 20 (the most Google Scholar exposes on a
-    single page) and returns a tuple of ``(titles, error_message)``. When Scholar
+    The function returns a tuple of ``(titles, error_message)``. When Scholar
     requires verification or the request fails, ``titles`` will be empty and the
     ``error_message`` will describe the issue.
     """
@@ -931,36 +927,53 @@ def fetch_scholar_prompt_results(
     if not trimmed:
         return [], "Please enter a search prompt."
 
-    capped_results = max(1, min(max_results, 20))
-    query_url = (
-        f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q={quote_plus(trimmed)}&num={capped_results}"
-    )
+    total_requested = max(1, max_results)
+    titles: List[str] = []
+    start_index = 0
 
-    html_text, error = _fetch_scholar_results_html(query_url, timeout)
-    if error == "rate_limit":
-        # Scholar occasionally throttles the initial request. Try again with a brief pause
-        # and a smaller result set to reduce the likelihood of triggering rate limits,
-        # then proceed with the stored titles for the rest of the workflow.
-        time.sleep(5)
-        retry_url = f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q={quote_plus(trimmed)}&num={min(capped_results, 10)}"
-        html_text, error = _fetch_scholar_results_html(retry_url, timeout)
+    while len(titles) < total_requested:
+        remaining = total_requested - len(titles)
+        batch_size = min(remaining, 20)
+        query_url = (
+            f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q="
+            f"{quote_plus(trimmed)}&num={batch_size}&start={start_index}"
+        )
+
+        html_text, error = _fetch_scholar_results_html(query_url, timeout)
         if error == "rate_limit":
-            return [], (
-                "Google Scholar is rate limiting requests (HTTP 429: Too Many "
-                "Requests). A retry was attempted automatically; please wait a "
-                "few minutes before trying again."
+            # Scholar occasionally throttles the request. Try again with a brief pause
+            # and a smaller result set to reduce the likelihood of triggering rate limits.
+            time.sleep(5)
+            retry_url = (
+                f"{SCHOLAR_BASE_URL}/scholar?hl=en&as_sdt=0%2C5&q="
+                f"{quote_plus(trimmed)}&num={min(batch_size, 10)}&start={start_index}"
             )
-    if error:
-        return [], error
+            html_text, error = _fetch_scholar_results_html(retry_url, timeout)
+            if error == "rate_limit":
+                return [], (
+                    "Google Scholar is rate limiting requests (HTTP 429: Too Many "
+                    "Requests). A retry was attempted automatically; please wait a "
+                    "few minutes before trying again."
+                )
+        if error:
+            return [], error
 
-    if page_requires_verification(html_text, query_url):
-        return [], "Google Scholar requires verification before showing the results."
+        if page_requires_verification(html_text, query_url):
+            return [], "Google Scholar requires verification before showing the results."
 
-    titles = _parse_scholar_titles(html_text, max_results=capped_results)
-    if not titles:
-        return [], "No titles were found on the Google Scholar results page."
+        page_titles = _parse_scholar_titles(html_text, max_results=batch_size)
+        if not page_titles:
+            if not titles:
+                return [], "No titles were found on the Google Scholar results page."
+            break
 
-    return titles, None
+        titles.extend(page_titles)
+        start_index += batch_size
+
+        if len(page_titles) < batch_size:
+            break
+
+    return titles[:total_requested], None
 
 
 class SkipRequested(Exception):
@@ -1492,19 +1505,16 @@ class App(tk.Tk):
         self.search_entry.grid(row=0, column=1, sticky="ew", padx=(5, 0))
         self.search_entry.config(state=tk.DISABLED)
 
-        tk.Label(search_frame, text="Number of results (1-20):").grid(
+        tk.Label(search_frame, text="Number of results:").grid(
             row=1, column=0, sticky="w", pady=(5, 0)
         )
-        self.search_results_spinbox = tk.Spinbox(
+        self.search_results_entry = tk.Entry(
             search_frame,
-            from_=1,
-            to=20,
             width=10,
             textvariable=self.search_results_var,
-            state="readonly",
+            state=tk.DISABLED,
         )
-        self.search_results_spinbox.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(5, 0))
-        self.search_results_spinbox.config(state=tk.DISABLED)
+        self.search_results_entry.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(5, 0))
 
         self.text_box = scrolledtext.ScrolledText(self, wrap=tk.WORD)
         self.text_box.grid(row=3, column=0, sticky="nsew", padx=10, pady=10)
@@ -1568,12 +1578,6 @@ class App(tk.Tk):
         )
         self.skip_button.grid(row=0, column=2, padx=(10, 0))
 
-        tk.Button(
-            controls_frame,
-            text="Cornell off-campus access instructions",
-            command=self._open_off_campus_help,
-        ).grid(row=0, column=3, padx=(10, 0))
-
     def _on_mode_change(self) -> None:
         mode = self.mode_var.get()
         if mode == "search":
@@ -1584,25 +1588,15 @@ class App(tk.Tk):
                 )
             )
             self.search_entry.config(state=tk.NORMAL)
-            self.search_results_spinbox.config(state="readonly")
+            self.search_results_entry.config(state=tk.NORMAL)
             self.text_box.config(state=tk.DISABLED)
         else:
             self.instruction_label.config(
                 text="Paste your bibliography entries below (one per line):"
             )
             self.search_entry.config(state=tk.DISABLED)
-            self.search_results_spinbox.config(state=tk.DISABLED)
+            self.search_results_entry.config(state=tk.DISABLED)
             self.text_box.config(state=tk.NORMAL)
-
-    def _open_off_campus_help(self) -> None:
-        try:
-            webbrowser.open(OFF_CAMPUS_HELP_URL)
-        except Exception:
-            messagebox.showinfo(
-                "Off-campus access",
-                "Please visit the Cornell off-campus access guide in your browser:\n"
-                f"{OFF_CAMPUS_HELP_URL}",
-            )
 
     def _choose_folder(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.path_var.get())
@@ -1622,7 +1616,7 @@ class App(tk.Tk):
             except ValueError:
                 messagebox.showerror(
                     "Invalid number of results",
-                    "Please choose how many Google Scholar results to use (1-20).",
+                    "Please enter how many Google Scholar results to use (1 or more).",
                 )
                 return
 
@@ -1632,15 +1626,6 @@ class App(tk.Tk):
                     "Please choose at least one Google Scholar result to use.",
                 )
                 return
-
-            if requested_results > 20:
-                requested_results = 20
-                self.search_results_var.set("20")
-                messagebox.showinfo(
-                    "Result limit",
-                    "Google Scholar only returns up to 20 results at once; the limit "
-                    "has been capped to 20 for this search.",
-                )
 
             references, error = fetch_scholar_prompt_results(
                 self.search_query_var.get(), max_results=requested_results
