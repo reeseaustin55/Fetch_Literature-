@@ -84,6 +84,9 @@ CHALLENGE_KEYWORDS = (
 
 
 SCHOLAR_BASE_URL = "https://scholar.google.com"
+OFF_CAMPUS_HELP_URL = (
+    "https://www-library-cornell-edu.proxy.library.cornell.edu/collections/off-campus-access/"
+)
 
 SCHOLAR_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1362,6 +1365,7 @@ class App(tk.Tk):
         self._current_browser_label = "Firefox"
         self.mode_var = tk.StringVar(value="bibliography")
         self.search_query_var = tk.StringVar()
+        self.search_results_var = tk.StringVar(value="20")
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1400,6 +1404,20 @@ class App(tk.Tk):
         self.search_entry = tk.Entry(search_frame, textvariable=self.search_query_var)
         self.search_entry.grid(row=0, column=1, sticky="ew", padx=(5, 0))
         self.search_entry.config(state=tk.DISABLED)
+
+        tk.Label(search_frame, text="Number of results (1-20):").grid(
+            row=1, column=0, sticky="w", pady=(5, 0)
+        )
+        self.search_results_spinbox = tk.Spinbox(
+            search_frame,
+            from_=1,
+            to=20,
+            width=10,
+            textvariable=self.search_results_var,
+            state="readonly",
+        )
+        self.search_results_spinbox.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(5, 0))
+        self.search_results_spinbox.config(state=tk.DISABLED)
 
         self.text_box = scrolledtext.ScrolledText(self, wrap=tk.WORD)
         self.text_box.grid(row=3, column=0, sticky="nsew", padx=10, pady=10)
@@ -1463,20 +1481,41 @@ class App(tk.Tk):
         )
         self.skip_button.grid(row=0, column=2, padx=(10, 0))
 
+        tk.Button(
+            controls_frame,
+            text="Cornell off-campus access instructions",
+            command=self._open_off_campus_help,
+        ).grid(row=0, column=3, padx=(10, 0))
+
     def _on_mode_change(self) -> None:
         mode = self.mode_var.get()
         if mode == "search":
             self.instruction_label.config(
-                text="Enter a Google Scholar search prompt to pull the first 20 results:"
+                text=(
+                    "Enter a Google Scholar search prompt to pull the first results "
+                    "(you choose how many):"
+                )
             )
             self.search_entry.config(state=tk.NORMAL)
+            self.search_results_spinbox.config(state="readonly")
             self.text_box.config(state=tk.DISABLED)
         else:
             self.instruction_label.config(
                 text="Paste your bibliography entries below (one per line):"
             )
             self.search_entry.config(state=tk.DISABLED)
+            self.search_results_spinbox.config(state=tk.DISABLED)
             self.text_box.config(state=tk.NORMAL)
+
+    def _open_off_campus_help(self) -> None:
+        try:
+            webbrowser.open(OFF_CAMPUS_HELP_URL)
+        except Exception:
+            messagebox.showinfo(
+                "Off-campus access",
+                "Please visit the Cornell off-campus access guide in your browser:\n"
+                f"{OFF_CAMPUS_HELP_URL}",
+            )
 
     def _choose_folder(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.path_var.get())
@@ -1491,8 +1530,33 @@ class App(tk.Tk):
             return
 
         if self.mode_var.get() == "search":
+            try:
+                requested_results = int(self.search_results_var.get())
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid number of results",
+                    "Please choose how many Google Scholar results to use (1-20).",
+                )
+                return
+
+            if requested_results <= 0:
+                messagebox.showerror(
+                    "Invalid number of results",
+                    "Please choose at least one Google Scholar result to use.",
+                )
+                return
+
+            if requested_results > 20:
+                requested_results = 20
+                self.search_results_var.set("20")
+                messagebox.showinfo(
+                    "Result limit",
+                    "Google Scholar only returns up to 20 results at once; the limit "
+                    "has been capped to 20 for this search.",
+                )
+
             references, error = fetch_scholar_prompt_results(
-                self.search_query_var.get(), max_results=20
+                self.search_query_var.get(), max_results=requested_results
             )
             if error:
                 messagebox.showwarning("Google Scholar search", error)
